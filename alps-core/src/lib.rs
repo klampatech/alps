@@ -5,23 +5,31 @@
 //!
 //! See `SPEC.md` for the full design.
 
+pub mod agent;
 pub mod domain;
 pub mod error;
-pub mod task;
-pub mod agent;
-pub mod plan;
 pub mod implement;
-pub mod review;
 pub mod judge;
-pub mod receipt;
+pub mod loop_;
 pub mod persistence;
+pub mod plan;
+pub mod receipt;
+pub mod review;
+pub mod task;
 
-pub use error::AlpsError;
-pub use task::{Task, Idle, Planned, Implemented, Reviewed, Done, Rejected, Failed, Attempt, FailureReason};
+pub use agent::{Agent, EmptyInput, sealed};
 pub use domain::*;
-pub use agent::Agent;
+pub use error::AlpsError;
+pub use implement::{ImplementAgent, ImplementConfig, ImplementError};
+pub use judge::{
+    JudgeAgent, JudgeContext, JudgeError, LlmJudge, StructuredJudge,
+    StructuredResult, AlwaysPassStructured, AlwaysPassLlm,
+};
+pub use loop_::drive;
+pub use persistence::{TaskWorkspace, PersistenceError, Persistable, persist_task};
 pub use plan::{PlanAgent, PlanError};
-pub use implement::{ImplementAgent, ImplementError};
-pub use review::{ReviewAgent, ReviewError};
-pub use judge::{JudgeAgent, JudgeError};
-pub use receipt::{Receipts, ImplementMetrics, ReviewSummary};
+pub use receipt::{ImplementMetrics, Receipt, Receipts, ReviewSummary};
+pub use review::{ReviewAgent, ReviewConfig, ReviewError};
+pub use task::{
+    Attempt, Done, Failed, FailureReason, Idle, Implemented, Planned, Rejected, Reviewed, Task,
+};

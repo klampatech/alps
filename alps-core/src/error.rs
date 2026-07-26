@@ -1,6 +1,7 @@
 //! Typed errors for ALPS.
 
 use crate::task::Attempt;
+use crate::persistence::PersistenceError;
 
 /// Top-level error for the ALPS orchestrator.
 #[derive(Debug, thiserror::Error)]
@@ -18,7 +19,7 @@ pub enum AlpsError {
     Judge(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     #[error("persistence failed: {0}")]
-    Persistence(#[source] std::io::Error),
+    Persistence(#[source] PersistenceError),
 
     #[error("serialization failed: {0}")]
     Serde(#[from] serde_json::Error),

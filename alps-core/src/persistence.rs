@@ -121,6 +121,14 @@ pub trait Persistable {
     fn persist_to(&self, workspace: &TaskWorkspace) -> Result<(), PersistenceError>;
 }
 
+/// Persist a task in its current state. Each state has its own writer.
+pub fn persist_task<S>(task: &Task<S>, workspace: &TaskWorkspace) -> Result<(), PersistenceError>
+where
+    Task<S>: Persistable,
+{
+    task.persist_to(workspace)
+}
+
 impl Persistable for Task<Idle> {
     fn persist_to(&self, workspace: &TaskWorkspace) -> Result<(), PersistenceError> {
         workspace.write_prompt(&self.prompt)
