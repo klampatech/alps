@@ -1,0 +1,6 @@
+# Tasks
+
+Each task is a subdirectory here, named `<task-id>`.
+Each task is a complete workspace with its own prompt, plan, implementation, review, and receipts.
+
+Git history is the audit trail — every state transition is committed.

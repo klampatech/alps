@@ -1,0 +1,3 @@
+[workspace]
+members = ["alps-core", "alps-cli"]
+resolver = "2"

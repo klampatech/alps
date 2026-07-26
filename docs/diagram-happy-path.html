@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ALPS — Happy Path Sequence</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #fafafa;
+            color: #222;
+            line-height: 1.5;
+        }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #ddd; padding-bottom: 8px; }
+        h2 { color: #333; margin-top: 32px; }
+        .mermaid {
+            background: white;
+            padding: 24px;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+            margin: 24px 0;
+        }
+        .meta {
+            background: #f0f7ff;
+            border-left: 4px solid #3b82f6;
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .legend { background: #fff; padding: 16px 24px; border-radius: 6px; border: 1px solid #e0e0e0; }
+        .legend li { margin-bottom: 4px; }
+        .legend code { background: #f0f0f0; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+        code { background: #f0f0f0; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <h1>ALPS — Happy Path Sequence</h1>
+    <div class="meta">
+        <strong>Scenario:</strong> Outer loop runs once. Plan → Implement → Review → Judge → Done. No rejections.
+    </div>
+
+    <h2>Diagram</h2>
+    <div class="mermaid">
+sequenceDiagram
+    actor Kyle
+    participant Alps as ALPS Core
+    participant Plan as Plan (Claude Code)
+    participant Ralph as Ralph (Codex loop)
+    participant Review as Review (Claude Code)
+    participant Judge as Judge (Hermes)
+
+    Kyle->>Alps: prompt + verify
+    activate Alps
+
+    Note over Alps: External while loop (until Judge PASS)
+    loop Outer loop (1 iteration)
+        Alps->>Plan: prompt
+        activate Plan
+        Plan-->>Alps: implementation plan
+        deactivate Plan
+
+        Alps->>Ralph: plan (prd.json)
+        activate Ralph
+        Note over Ralph: Inner loop (until COMPLETE)
+        loop Ralph inner loop
+            Ralph->>Ralph: implement story → test → commit
+        end
+        Ralph-->>Alps: finished work + commits
+        deactivate Ralph
+
+        Alps->>Review: implementation
+        activate Review
+        Review-->>Alps: findings + assertions
+        deactivate Review
+
+        Alps->>Judge: review + plan + impl
+        activate Judge
+        Judge-->>Alps: PASS + receipts
+        deactivate Judge
+    end
+
+    Alps-->>Kyle: done + receipts
+    deactivate Alps
+    </div>
+
+    <h2>Legend</h2>
+    <div class="legend">
+        <ul>
+            <li><strong>Kyle</strong>: human — initiates the loop, verifies the result</li>
+            <li><strong>ALPS Core</strong>: orchestrator — type-state machine driver</li>
+            <li><strong>Plan</strong>: Claude Code plan agent — <code>prompt</code> → <code>Plan</code> (granular implementation plan)</li>
+            <li><strong>Ralph</strong>: Ralph loop with Codex — <code>Plan</code> → finished work (each story implemented, tested, committed)</li>
+            <li><strong>Review</strong>: Claude Code adversarial review — <code>Implementation</code> → <code>Review</code> (findings + assertions)</li>
+            <li><strong>Judge</strong>: Hermes assertion matcher — <code>Review</code> + <code>Plan</code> + <code>Implementation</code> → <code>Judgment</code></li>
+        </ul>
+    </div>
+
+    <h2>Notes</h2>
+    <ul>
+        <li>The outer loop body is the four state transitions: <code>Idle → Planned → Implemented → Reviewed → Done</code>.</li>
+        <li>The inner loop is Ralph's own loop — ALPS does not see inner iterations, only the final <code>Implementation</code>.</li>
+        <li>On Judge PASS, the loop exits and Kyle is delivered <code>Receipts</code> (plan summary, implement metrics, review summary, judge metadata).</li>
+        <li>All file artifacts are persisted and committed to git at each state transition.</li>
+    </ul>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default', sequence: { showSequenceNumbers: true } });
+    </script>
+</body>
+</html>

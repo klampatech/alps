@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>ALPS — Rejection Restart Sequence</title>
+    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 0 20px;
+            background: #fafafa;
+            color: #222;
+            line-height: 1.5;
+        }
+        h1 { color: #1a1a1a; border-bottom: 2px solid #ddd; padding-bottom: 8px; }
+        h2 { color: #333; margin-top: 32px; }
+        .mermaid {
+            background: white;
+            padding: 24px;
+            border-radius: 8px;
+            border: 1px solid #e0e0e0;
+            margin: 24px 0;
+        }
+        .meta {
+            background: #fff4e5;
+            border-left: 4px solid #f59e0b;
+            padding: 12px 16px;
+            border-radius: 6px;
+            font-size: 14px;
+        }
+        .legend { background: #fff; padding: 16px 24px; border-radius: 6px; border: 1px solid #e0e0e0; }
+        .legend code { background: #f0f0f0; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+        code { background: #f0f0f0; padding: 1px 6px; border-radius: 3px; font-size: 13px; }
+    </style>
+</head>
+<body>
+    <h1>ALPS — Rejection Restart Sequence</h1>
+    <div class="meta">
+        <strong>Scenario:</strong> Judge REJECTs. Feedback is appended to prompt. Outer loop restarts at Plan. Repeats until Judge PASS or MaxAttempts exceeded.
+    </div>
+
+    <h2>Diagram</h2>
+    <div class="mermaid">
+sequenceDiagram
+    actor Kyle
+    participant Alps as ALPS Core
+    participant Plan as Plan (Claude Code)
+    participant Ralph as Ralph (Codex loop)
+    participant Review as Review (Claude Code)
+    participant Judge as Judge (Hermes)
+    participant FS as tasks/
+    participant Git as git
+
+    Kyle->>Alps: prompt
+    activate Alps
+    Alps->>FS: create tasks/<id>/
+    FS->>Git: commit "task started"
+
+    Note over Alps: External while loop (until Judge PASS or attempts >= MAX)
+    loop Rejection loop (N attempts)
+        Alps->>Plan: prompt [± feedback]
+        activate Plan
+        Plan-->>Alps: implementation plan
+        deactivate Plan
+        Alps->>FS: write plan.json
+        FS->>Git: commit "plan"
+
+        Alps->>Ralph: plan → prd.json
+        activate Ralph
+        Note over Ralph: Inner loop (until COMPLETE)
+        Ralph->>FS: commits, prd.json
+        Ralph-->>Alps: finished work
+        deactivate Ralph
+        FS->>Git: commit "implement"
+
+        Alps->>Review: implementation
+        activate Review
+        Review-->>Alps: findings + assertions
+        deactivate Review
+        Alps->>FS: write review.json
+        FS->>Git: commit "review"
+
+        Alps->>Judge: review + plan + impl
+        activate Judge
+        Judge-->>Alps: REJECT + feedback
+        deactivate Judge
+
+        Note over Alps: append feedback to prompt<br/>record Attempt in history
+        Alps->>FS: write feedback.json
+        FS->>Git: commit "reject"
+    end
+
+    Note over Alps: next iteration sees enriched prompt
+    Alps->>Plan: prompt + feedback
+    activate Plan
+    Plan-->>Alps: revised plan
+    deactivate Plan
+    Alps->>Ralph: revised plan
+    activate Ralph
+    Ralph-->>Alps: finished work
+    deactivate Ralph
+    Alps->>Review: implementation
+    activate Review
+    Review-->>Alps: findings
+    deactivate Review
+    Alps->>Judge: findings
+    activate Judge
+    Judge-->>Alps: PASS + receipts
+    deactivate Judge
+
+    Alps->>FS: write receipts.json
+    FS->>Git: commit "done"
+    Alps-->>Kyle: done + receipts
+    deactivate Alps
+    </div>
+
+    <h2>Legend</h2>
+    <div class="legend">
+        <ul>
+            <li><strong>FS / Git</strong>: every state transition is persisted to <code>tasks/&lt;id&gt;/</code> and committed to git. The history is the audit trail.</li>
+            <li><strong>Rejection loop</strong>: outer loop iterates until Judge PASS. Each iteration's <code>Plan</code>, <code>Implementation</code>, <code>Review</code>, and <code>Feedback</code> are all recorded in <code>history</code>.</li>
+            <li><strong>Feedback append</strong>: the rejected feedback is appended to the prompt so the next Plan call sees the failure context. The plan agent can then produce a revised plan.</li>
+            <li><strong>MaxAttempts</strong>: the outer loop has a cap (proposed: 3). Beyond that, the task transitions to <code>Failed</code> with the full history.</li>
+        </ul>
+    </div>
+
+    <h2>State transitions during rejection</h2>
+    <ul>
+        <li><code>Reviewed</code> → <code>Rejected</code> (via <code>judge(Judgment::Reject)</code>)</li>
+        <li><code>Rejected</code> → <code>Idle</code> (via <code>reset()</code>, which appends feedback)</li>
+        <li><code>Idle</code> → <code>Planned</code> (via <code>plan(plan)</code>, attempt counter increments)</li>
+    </ul>
+
+    <script>
+        mermaid.initialize({ startOnLoad: true, theme: 'default', sequence: { showSequenceNumbers: true } });
+    </script>
+</body>
+</html>
