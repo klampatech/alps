@@ -94,11 +94,26 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
         Prompt::new(prompt),
     );
 
-    // MVP agent stubs. Real impls will spawn CLIs (claude, ralph.sh, hermes).
+    // Resolve the ALPS repo root (where scripts/ and the vendored ralph.sh live).
+    // We use the binary's own path: target/{debug,release}/alps → ../../..
+    let alps_root = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
+    let ralph_path = alps_root.join("scripts/ralph.sh");
+    let claude_prompt_path = alps_root.join("scripts/CLAUDE.md");
+
     let plan = PlanAgent::new("claude-sonnet-4");
     let implement = ImplementAgent::new(
         workspace.root.clone(),
-        alps_core::implement::ImplementConfig::default(),
+        alps_core::implement::ImplementConfig {
+            ralph_path,
+            claude_prompt_path,
+            ..Default::default()
+        },
     );
     let review = ReviewAgent::default();
     let judge = JudgeAgent::new(
@@ -112,8 +127,11 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
             alps_core::persistence::persist_task(&done, &workspace)
                 .map_err(|e| anyhow::anyhow!("persistence failed: {}", e))?;
 
-            // Git commit the final state
-            git_commit(&format!("done: {}", task_id.as_str()))?;
+            // Git commit the final state. Best-effort: if there's no .git
+            // (e.g. running from a fresh checkout) we just log and continue.
+            if let Err(e) = git_commit(&format!("done: {}", task_id.as_str())) {
+                eprintln!("warning: git commit skipped: {}", e);
+            }
 
             // Print markdown summary to stdout
             print_markdown(&done);
