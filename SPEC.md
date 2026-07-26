@@ -684,8 +684,11 @@ pub async fn drive(
 - Files + git for state (no DB)
 - Stub plan/review/judge agents that invoke CLIs as subprocesses
 - Type-state for the outer loop
+- **Hybrid Judge** — verifiable DoD checks first, then LLM (Hermes) for soft judgment
+- **Unbounded loop** — no max attempts; brute force until Judge passes ("must succeed eventually")
+- **stdout-only notifications** — CLI prints receipt summary, writes `tasks/<id>/receipts.json`
+- **Markdown + JSON receipts** — terminal summary for Kyle, JSON for downstream tooling
 - Rejection restart loop
-- Receipts written to JSON
 - Ralph invoked as subprocess via `ralph.sh`
 - CLI: `alps run "prompt"`
 
@@ -713,16 +716,51 @@ pub async fn drive(
 | **Plan** | Claude Code | `cat prompt.md \| claude -p` | `Prompt` | `Plan` (parsed from JSON) |
 | **Implement** | Ralph + Codex | `./ralph.sh [--max-iters N]` | `Plan` (→ `prd.json`) | `Implementation` (parsed from git log + progress.txt) |
 | **Review** | Claude Code | `cat impl.md \| claude -p` | `Implementation` | `Review` (parsed from JSON) |
-| **Judge** | Hermes | (in-process or via CLI) | `Review` + `Plan` + `Implementation` | `Judgment` |
+| **Judge** | Hybrid: structured DoD + Hermes (LLM) | (in-process + subprocess) | `JudgeContext` (plan + impl + review) | `Judgment` |
 
 For MVP, Plan and Review use JSON-output prompts. Implement wraps Ralph. Judge is the most interesting — see open questions.
 
-## 11. Open Questions
+## 11. Resolved Decisions
 
-1. **Judge implementation** — is the judge a structured assertion matcher (deterministic), an LLM call, or both? My read: heavy LLM (Hermes) that consumes review assertions and verifies against implementation artifacts, but **also** loads and runs the DoD-criterion checks if they're verifiable (tests, typecheck, etc.). Need to confirm.
-2. **Max attempts on the outer loop** — unbounded, or capped? Suggest capped at 3 with a clear failure mode.
-3. **Notifications** — how does Kyle learn the task is Done? Discord pub/sub? File watch? CLI status?
-4. **Receipts format** — what does Kyle see? Markdown summary? JSON? Full HTML report?
-5. **Per-task git branches** — branch per task, or single main with date-stamped commits? Suggest single main for MVP.
-6. **AGENTS.md / CLAUDE.md updates** — does ALPS propagate learnings from implement to the user's repo, or only within the task workspace?
-7. **Testing the agent layer** — how do we test plan/review/judge without burning tokens? Mock CLIs? Recorded fixtures?
+### 11.1 Judge — Hybrid (verifiable DoD + LLM) — resolved 2026-07-26
+
+Two-stage:
+
+1. **Structured pass**: run all `DefinitionOfDone { verifiable: true }` criteria
+   deterministically (tests, typecheck, lint, etc.). If any verifiable check fails,
+   the verdict is **REJECT** with the failed criteria as feedback.
+2. **LLM pass**: if all verifiable checks pass, call Hermes (LLM) with the review
+   findings and the implementation. The LLM can hold the verdict (PASS) or reject
+   (REJECT) with soft reasoning (code quality, design, etc.).
+
+Both must clear for PASS. Hermes can reject a structured PASS if it sees soft issues.
+This is the "heavy LLM" judgement: it consumes the review assertions and verifies
+them against the implementation artifacts, but it also runs the DoD checks if any
+are verifiable.
+
+### 11.2 Max attempts — Unbounded — resolved 2026-07-26
+
+The loop has no cap. On Judge reject, the loop restarts with feedback appended
+to the prompt. Philosophy: **brute force development** — "it must succeed eventually."
+
+Cost is tracked in receipts (total attempts, total elapsed) but not bounded.
+
+### 11.3 Notifications — stdout only — resolved 2026-07-26
+
+CLI runs synchronously. On Done, prints the receipt summary to stdout and writes
+`tasks/<id>/receipts.json`. No Discord, no polling, no file watch.
+
+Kyle runs `alps run "..."` and gets the result on the terminal. The receipts.json
+file is the durable artifact for downstream tooling.
+
+### 11.4 Receipts format — Markdown + JSON — resolved 2026-07-26
+
+- **Markdown**: printed to stdout for human reading (Kyle sees it on terminal)
+- **JSON**: written to `tasks/<id>/receipts.json` for downstream tooling
+- CLI exit code: 0 on Done, 1 on `AlpsError`, 2 on Failed
+
+### 11.5 Deferred (Phase 2+)
+
+- Per-task branches (currently single main with date-stamped commits)
+- AGENTS.md / CLAUDE.md propagation from implement step
+- Agent test fixtures (mock CLIs vs recorded fixtures)
