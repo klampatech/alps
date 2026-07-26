@@ -20,7 +20,7 @@ use crate::implement::ImplementAgent;
 use crate::judge::{JudgeAgent, JudgeContext};
 use crate::persistence::{TaskWorkspace, persist_task};
 use crate::plan::PlanAgent;
-use crate::review::ReviewAgent;
+use crate::review::{ReviewAgent, ReviewContext};
 use crate::task::*;
 
 /// Drive the outer loop until Judge passes.
@@ -67,7 +67,11 @@ fn run_iteration<'a>(
 
         // ── Review ──
         eprintln!("[review] running");
-        let review_out = review.run(task.state.implementation.clone()).await
+        let review_ctx = ReviewContext {
+            plan: task.state.plan.clone(),
+            implementation: task.state.implementation.clone(),
+        };
+        let review_out = review.run(review_ctx).await
             .map_err(|e| AlpsError::ReviewAgent(Box::new(e)))?;
         let task = task.review(review_out);
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;

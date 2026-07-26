@@ -29,7 +29,7 @@ pub use loop_::drive;
 pub use persistence::{TaskWorkspace, PersistenceError, Persistable, persist_task};
 pub use plan::{PlanAgent, PlanError};
 pub use receipt::{ImplementMetrics, Receipt, Receipts, ReviewSummary};
-pub use review::{ReviewAgent, ReviewConfig, ReviewError};
+pub use review::{ReviewAgent, ReviewConfig, ReviewContext, ReviewError};
 pub use task::{
     Attempt, Done, Failed, FailureReason, Idle, Implemented, Planned, Rejected, Reviewed, Task,
 };
