@@ -1,13 +1,17 @@
-//! Review agent — Claude Code adversarial review.
+//! Review agent — Claude Code (adversarial review).
 //!
 //! Consumes an `Implementation`, produces a `Review` (findings + assertions).
+//!
+//! MVP: stub that returns a positive Review (the loop needs to advance for the
+//! smoke test). Real impl will spawn `claude -p` with an adversarial prompt that
+//! asks Claude to find bugs and verify the implementation against the DoD.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::agent::{Agent, sealed};
-use crate::domain::{Implementation, Review};
+use crate::domain::{Assertion, Implementation, Review};
 
 #[derive(Debug, Error)]
 pub enum ReviewError {
@@ -36,7 +40,7 @@ impl Default for ReviewConfig {
     }
 }
 
-/// Default Review agent — invokes Claude Code via stdin and parses JSON output.
+/// Review agent — currently a stub that returns a positive Review.
 pub struct ReviewAgent {
     pub config: ReviewConfig,
 }
@@ -65,25 +69,60 @@ impl Agent for ReviewAgent {
         "review"
     }
 
-    async fn run(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> {
-        // MVP: stub. Real impl:
-        //   1. Build review prompt: impl artifacts + plan + DoD
-        //   2. Spawn `claude --dangerously-skip-permissions -p`
-        //   3. Parse JSON output → Review { findings, assertions }
-        Err(ReviewError::ClaudeCode(format!(
-            "ReviewAgent.run not yet implemented; model={}",
-            self.config.model
-        )))
+    async fn run(&self, input: Implementation) -> Result<Self::Output, Self::Error> {
+        // MVP stub: emit a positive Review so the loop can reach the Judge.
+        // Real impl will spawn Claude Code with an adversarial prompt:
+        //   - "Examine the implementation. Find bugs. Verify each criterion."
+        //   - Parse JSON output → Review { findings, assertions }
+        let assertion = Assertion {
+            criterion: "build_succeeds".to_string(),
+            passed: input.commits.len() > 0,
+            evidence: format!("{} commits in implementation", input.commits.len()),
+        };
+        let artifacts_present = input.artifacts.len() > 0;
+        let artifacts_assertion = Assertion {
+            criterion: "artifacts_present".to_string(),
+            passed: artifacts_present,
+            evidence: format!("{} artifacts", input.artifacts.len()),
+        };
+
+        Ok(Review {
+            findings: vec![],
+            assertions: vec![assertion, artifacts_assertion],
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Artifact, ArtifactKind, Commit};
+
+    #[tokio::test]
+    async fn review_stub_returns_positive_for_implementation() {
+        let agent = ReviewAgent::default();
+        let impl_ = Implementation {
+            ralph_branch: "alps/test".to_string(),
+            prd_path: PathBuf::from("/tmp/prd.json"),
+            commits: vec![Commit {
+                sha: "abc123".to_string(),
+                message: "feat: test".to_string(),
+            }],
+            artifacts: vec![Artifact {
+                path: PathBuf::from("main.rs"),
+                kind: ArtifactKind::Source,
+            }],
+        };
+        let review = agent.run(impl_).await.unwrap();
+        assert_eq!(review.assertions.len(), 2);
+        assert!(review.assertions.iter().all(|a| a.passed));
+    }
 
     #[test]
     fn review_agent_name() {
         let agent = ReviewAgent::default();
         assert_eq!(agent.name(), "review");
     }
+
+    use std::path::PathBuf;
 }

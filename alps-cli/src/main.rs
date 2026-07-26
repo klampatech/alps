@@ -96,7 +96,10 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
 
     // MVP agent stubs. Real impls will spawn CLIs (claude, ralph.sh, hermes).
     let plan = PlanAgent::new("claude-sonnet-4");
-    let implement = ImplementAgent::default();
+    let implement = ImplementAgent::new(
+        workspace.root.clone(),
+        alps_core::implement::ImplementConfig::default(),
+    );
     let review = ReviewAgent::default();
     let judge = JudgeAgent::new(
         Arc::new(AlwaysPassStructured),
