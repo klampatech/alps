@@ -95,12 +95,17 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee /dev/stderr) || true
   else
     # Codex: --dangerously-bypass-approvals-and-sandbox = full autonomous mode.
-    # We cd into SCRIPT_DIR first so codex's process cwd is the ralph workspace
-    # (codex's -C flag sets the *agent* working root but not necessarily the
-    # process cwd that exec_command sees; running `cd` first is bulletproof).
-    # The prompt is fed via stdin from AGENTS.md (codex reads from stdin when no arg is given).
-    cd "$SCRIPT_DIR" || { echo "codex: failed to cd to $SCRIPT_DIR" >&2; exit 1; }
-    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox < "$SCRIPT_DIR/AGENTS.md" 2>&1 | tee /dev/stderr) || true
+    # The implement agent invokes ralph.sh with current_dir = the ralph workspace
+    # (tasks/<id>/implementation/ralph/), so our process cwd IS the ralph dir.
+    # We feed AGENTS.md from the ralph dir (not $SCRIPT_DIR) so the prompt file
+    # codex sees matches the project state in cwd.
+    RALPH_AGENTS="$(pwd)/AGENTS.md"
+    if [[ ! -f "$RALPH_AGENTS" ]]; then
+      # Fallback: source AGENTS.md in alps/scripts/. Identical content, but
+      # this path means the ralph dir wasn't set up correctly.
+      RALPH_AGENTS="$SCRIPT_DIR/AGENTS.md"
+    fi
+    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox < "$RALPH_AGENTS" 2>&1 | tee /dev/stderr) || true
   fi
   
   # Check for completion signal
