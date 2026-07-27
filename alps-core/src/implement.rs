@@ -42,6 +42,51 @@ pub enum ImplementError {
     Serde(#[from] serde_json::Error),
 }
 
+/// Ralph tool backend. The implement agent wraps ralph.sh, which dispatches
+/// to one of these backends per iteration. Default is `Codex`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RalphTool {
+    /// Claude Code via `claude --dangerously-skip-permissions`. Reads CLAUDE.md.
+    Claude,
+    /// OpenAI Codex via `codex exec --dangerously-bypass-approvals-and-sandbox`. Reads AGENTS.md.
+    Codex,
+    /// Sourcegraph Amp. Legacy/default in upstream ralph.sh.
+    Amp,
+}
+
+impl RalphTool {
+    /// CLI flag value passed to ralph.sh (`--tool <name>`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RalphTool::Claude => "claude",
+            RalphTool::Codex => "codex",
+            RalphTool::Amp => "amp",
+        }
+    }
+
+    /// Prompt filename vendored alongside ralph.sh.
+    pub fn prompt_filename(&self) -> &'static str {
+        match self {
+            RalphTool::Claude => "CLAUDE.md",
+            RalphTool::Codex => "AGENTS.md",
+            RalphTool::Amp => "prompt.md",
+        }
+    }
+}
+
+impl std::fmt::Display for RalphTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Default for RalphTool {
+    fn default() -> Self {
+        RalphTool::Codex
+    }
+}
+
 /// Config for the Implement agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementConfig {
@@ -49,12 +94,19 @@ pub struct ImplementConfig {
     pub ralph_path: PathBuf,
     /// Path to the `CLAUDE.md` (Ralph's prompt file for Claude Code).
     pub claude_prompt_path: PathBuf,
+    /// Path to the `AGENTS.md` (Ralph's prompt file for Codex).
+    #[serde(default = "default_agents_prompt_path")]
+    pub agents_prompt_path: PathBuf,
     /// Max Ralph iterations before giving up.
     pub max_iterations: u32,
-    /// Tool to use (default: "claude").
-    pub tool: String,
+    /// Tool backend for Ralph. Default: `codex`.
+    pub tool: RalphTool,
     /// Optional init command to run before Ralph (e.g. "cargo init --name foo").
     pub init_command: Option<String>,
+}
+
+fn default_agents_prompt_path() -> PathBuf {
+    PathBuf::from("./scripts/AGENTS.md")
 }
 
 impl Default for ImplementConfig {
@@ -62,8 +114,9 @@ impl Default for ImplementConfig {
         ImplementConfig {
             ralph_path: PathBuf::from("./scripts/ralph.sh"),
             claude_prompt_path: PathBuf::from("./scripts/CLAUDE.md"),
+            agents_prompt_path: default_agents_prompt_path(),
             max_iterations: 20,
-            tool: "claude".to_string(),
+            tool: RalphTool::default(),
             init_command: None,
         }
     }
@@ -122,8 +175,14 @@ impl Agent for ImplementAgent {
         run_git(&ralph_dir, &["config", "user.name", "ALPS"])?;
         run_git(&ralph_dir, &["config", "commit.gpgsign", "false"])?;
 
-        // ── 3. Copy ralph.sh + CLAUDE.md into the working dir ──
-        copy_ralph_files(&self.config.ralph_path, &self.config.claude_prompt_path, &ralph_dir)?;
+        // ── 3. Copy ralph.sh + CLAUDE.md + AGENTS.md into the working dir ──
+        copy_ralph_files(
+            &self.config.ralph_path,
+            &self.config.claude_prompt_path,
+            &self.config.agents_prompt_path,
+            self.config.tool,
+            &ralph_dir,
+        )?;
 
         // ── 4. Generate prd.json from Plan ──
         let prd = plan_to_prd(&task_id, &input);
@@ -151,7 +210,7 @@ impl Agent for ImplementAgent {
         );
         let ralph_status = Command::new(&self.config.ralph_path)
             .args([
-                "--tool", &self.config.tool,
+                "--tool", self.config.tool.as_str(),
                 &self.config.max_iterations.to_string(),
             ])
             .current_dir(&ralph_dir)
@@ -297,6 +356,8 @@ async fn run_shell(dir: &Path, cmd: &str) -> Result<(), ImplementError> {
 fn copy_ralph_files(
     ralph_src: &Path,
     claude_src: &Path,
+    agents_src: &Path,
+    tool: RalphTool,
     ralph_dir: &Path,
 ) -> Result<(), ImplementError> {
     use std::os::unix::fs::PermissionsExt;
@@ -309,14 +370,24 @@ fn copy_ralph_files(
     std::fs::set_permissions(&ralph_dst, std::fs::Permissions::from_mode(0o755))
         .map_err(|e| ImplementError::RalphSetup(format!("chmod ralph.sh: {}", e)))?;
 
-    // Copy CLAUDE.md (if it exists)
-    if claude_src.exists() {
-        let claude_dst = ralph_dir.join("CLAUDE.md");
-        std::fs::copy(claude_src, &claude_dst).map_err(|e| {
-            ImplementError::RalphSetup(format!("copy CLAUDE.md from {:?}: {}", claude_src, e))
+    // Copy the prompt file that matches the chosen tool.
+    // Always copy both AGENTS.md and CLAUDE.md when they exist — Ralph will
+    // only read the one it needs, but the file presence keeps ralph.sh happy.
+    for src in [claude_src, agents_src] {
+        if !src.exists() {
+            continue;
+        }
+        let fname = src
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| ImplementError::RalphSetup(format!("bad prompt path: {:?}", src)))?;
+        let dst = ralph_dir.join(fname);
+        std::fs::copy(src, &dst).map_err(|e| {
+            ImplementError::RalphSetup(format!("copy {} from {:?}: {}", fname, src, e))
         })?;
     }
 
+    let _ = tool; // tool choice is communicated via --tool flag, not file content
     Ok(())
 }
 
@@ -352,7 +423,7 @@ fn read_artifacts(ralph_dir: &Path) -> Result<Vec<Artifact>, ImplementError> {
         .map_err(|e| ImplementError::RalphSetup(format!("read_dir: {}", e)))?;
 
     // Skip files we added ourselves
-    const SKIP: &[&str] = &["ralph.sh", "CLAUDE.md", "prd.json", "progress.txt", ".git"];
+    const SKIP: &[&str] = &["ralph.sh", "CLAUDE.md", "AGENTS.md", "prd.json", "progress.txt", ".git"];
 
     for entry in entries {
         let entry = entry.map_err(|e| ImplementError::RalphSetup(format!("entry: {}", e)))?;
@@ -476,6 +547,46 @@ mod tests {
             agent.ralph_dir(),
             PathBuf::from("/home/kyle/Development/alps/tasks/2026-07-26T120000-abc/implementation/ralph")
         );
+    }
+
+    #[test]
+    fn ralph_tool_default_is_codex() {
+        // ALPS defaults to codex so the implement loop uses OpenAI Codex.
+        assert_eq!(RalphTool::default(), RalphTool::Codex);
+        assert_eq!(ImplementConfig::default().tool, RalphTool::Codex);
+    }
+
+    #[test]
+    fn ralph_tool_as_str() {
+        assert_eq!(RalphTool::Claude.as_str(), "claude");
+        assert_eq!(RalphTool::Codex.as_str(), "codex");
+        assert_eq!(RalphTool::Amp.as_str(), "amp");
+    }
+
+    #[test]
+    fn ralph_tool_prompt_filename() {
+        assert_eq!(RalphTool::Claude.prompt_filename(), "CLAUDE.md");
+        assert_eq!(RalphTool::Codex.prompt_filename(), "AGENTS.md");
+        assert_eq!(RalphTool::Amp.prompt_filename(), "prompt.md");
+    }
+
+    #[test]
+    fn ralph_tool_serializes_lowercase() {
+        // The on-disk config files use lowercase tool names. Verify roundtrip.
+        for tool in [RalphTool::Claude, RalphTool::Codex, RalphTool::Amp] {
+            let json = serde_json::to_string(&tool).unwrap();
+            let back: RalphTool = serde_json::from_str(&json).unwrap();
+            assert_eq!(tool, back);
+        }
+        assert_eq!(serde_json::to_string(&RalphTool::Codex).unwrap(), "\"codex\"");
+    }
+
+    #[test]
+    fn ralph_tool_display_matches_as_str() {
+        // Display is what eprintln uses in the implement log line.
+        for tool in [RalphTool::Claude, RalphTool::Codex, RalphTool::Amp] {
+            assert_eq!(format!("{}", tool), tool.as_str());
+        }
     }
 
     #[test]
