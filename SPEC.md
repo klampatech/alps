@@ -1,8 +1,46 @@
 # ALPS — Specification
 
-> **Status**: Draft v0.1
+> **Status**: v0.1 implemented + working; reject path verified
 > **Author**: Kyle + Evo
-> **Date**: 2026-07-26
+> **Date**: 2026-07-26 (initial); 2026-07-27 (updated for v0.1 implementation)
+
+## 0. What's been built since the original spec
+
+The v0.1 spec was written before any code shipped. As of 2026-07-27, the
+core loop is implemented and working end-to-end. Below is the changelog of
+what landed in `klampatech/alps` between the spec and now.
+
+| Date | Commit | What it added |
+|---|---|---|
+| 2026-07-26 | `0275945` | Initial Cargo scaffold + 3 Mermaid sequence diagrams (happy/reject/multi-iteration) |
+| 2026-07-26 | `1435477` | Resolved 4 open questions: hybrid judge, unbounded attempts, stdout notifications, md+json receipts |
+| 2026-07-26 | `21a08d4` | `loop_::drive` with type-state-safe recursion on Judge Reject |
+| 2026-07-26 | `a36978f` | Plan agent wired to real Claude Code (`--dangerously-skip-permissions -p`) |
+| 2026-07-26 | `6271e3a` | Implement agent wired to `scripts/ralph.sh` (Ralph as subprocess) |
+| 2026-07-26 | `a6382a2` | Review agent wired (adversarial Claude Code) |
+| 2026-07-26 | `670eece` | Judge agent wired (Hermes via Claude Code, JSON-only) |
+| 2026-07-26 | `b4aa362` | `DoDRunner` (auto-detects Python/Rust project type, runs tests) |
+| 2026-07-26 | `799067d`–`752c41a` | Codex as default Ralph tool; cwd-relative AGENTS.md fallback; COMPLETE-signal fix |
+| 2026-07-26 | `4013f6d` | `.codex-last-message.txt` gitignore |
+| 2026-07-26 | `2be94ab` | Real implement metrics in receipts (was zeros); silent auto-commit when no changes |
+| 2026-07-27 | `f452ca3` | **Per-task git branches** (`alps/<task-id>`) + **AGENTS.md propagation** from ralph → review/judge/next-plan |
+| 2026-07-27 | `46327b4` | **Workdir completion guard** — refuses re-invocation within 5s of a prior success (defensive guard against Claude TUI auto-re-running alps; `--force` bypass) |
+| 2026-07-27 | `6ebaf92` | **Nested git repo exclusion** — `commit_smart` writes `<workdir>/.git/info/exclude` so the ralph nested `.git/` doesn't fatal `git add -A` on git 2.42+ |
+| 2026-07-27 | `731fbd3` | **Reject path verification** — `for_test` mock-agent infrastructure + `drive_rejects_then_passes_appends_feedback_to_next_plan` integration test (deterministic, <100ms) |
+
+### Verified end-to-end
+
+- **Happy path** — 5 successful smokes (smoke3, smoke4, smoke5, smoke6, smoke7) — all pass with Judge LLM verdict "pass" on the first attempt.
+- **Reject path** — verified by unit test (not a real smoke — codex is too smart to fail with a deterministic prompt; the test directly drives `drive()` with a scripted Judge that returns `Reject` then `Pass`).
+- **AGENTS.md propagation** — verified end-to-end; the task-level `AGENTS.md` accumulates patterns from each ralph iteration and is fed back to review/judge/next-plan.
+- **Per-task branches** — verified; `git log` on the per-task branch shows `feat: [US-XXX]` commits per ralph story + `done: <task-id>` final auto-commit.
+- **Workdir guard** — verified manually; sentinel written at end, blocks re-invocation within 5s, `--force` bypasses.
+- **Nested repo exclusion** — verified; smoke7 produced no "embedded git repository" warning (was fatal on git 2.42+).
+
+### Known issues
+
+- **Plan agent JSON flakiness** — observed in the herdr smoke during reject-path testing: Plan occasionally emits a trailing-comma JSON that fails to parse, killing the run. Not in the loop's reject path (the Plan failure exits with `AlpsError`, not `Judgment::Reject`). Worth a fix (either a JSON-tolerating parser or a Plan retry-on-parse-fail). Filed as #3 below.
+- **Type-state attempt counter resets on `Rejected::reset()`** — the second iteration's plan shows `attempt=1`, not `2`. Not a bug per se (each `Planned` represents one attempt at a plan), but the type-state doesn't track global iteration. The `Rejected` struct carries `attempts: u32` but `reset()` doesn't pass it forward. Worth a small refactor if we want a global attempt counter on `Task<Done>`.
 
 ## 1. What is ALPS?
 
@@ -11,7 +49,7 @@ ALPS is a four-step orchestrator that takes a high-stakes prompt and drives it t
 1. **Plan** — Claude Code, prompt → granular implementation plan
 2. **Implement** — Ralph loop with Codex, plan → finished work
 3. **Review** — Claude Code, adversarial review → findings + assertions
-4. **Judge** — Hermes, assertion matching → verdict
+4. **Judge** — Hermes (Hybrid: structured DoD + LLM), assertion matching → verdict
 
 If the Judge **rejects**, the loop restarts at Plan with feedback appended to the prompt. If the Judge **passes**, the task is surfaced to Kyle with receipts.
 
@@ -680,34 +718,41 @@ pub async fn drive(
 
 ### MVP (Phase 1) — what we build first
 
-- Single task at a time, single process
-- Files + git for state (no DB)
-- Stub plan/review/judge agents that invoke CLIs as subprocesses
-- Type-state for the outer loop
-- **Hybrid Judge** — verifiable DoD checks first, then LLM (Hermes) for soft judgment
-- **Unbounded loop** — no max attempts; brute force until Judge passes ("must succeed eventually")
-- **stdout-only notifications** — CLI prints receipt summary, writes `tasks/<id>/receipts.json`
-- **Markdown + JSON receipts** — terminal summary for Kyle, JSON for downstream tooling
-- Rejection restart loop
-- Ralph invoked as subprocess via `ralph.sh`
-- CLI: `alps run "prompt"`
+- [x] Single task at a time, single process
+- [x] Files + git for state (no DB)
+- [x] Stub plan/review/judge agents that invoke CLIs as subprocesses
+- [x] Type-state for the outer loop
+- [x] **Hybrid Judge** — verifiable DoD checks first, then LLM (Hermes) for soft judgment
+- [x] **Unbounded loop** — no max attempts; brute force until Judge passes ("must succeed eventually")
+- [x] **stdout-only notifications** — CLI prints receipt summary, writes `tasks/<id>/receipts.json`
+- [x] **Markdown + JSON receipts** — terminal summary for Kyle, JSON for downstream tooling
+- [x] Rejection restart loop
+- [x] Ralph invoked as subprocess via `ralph.sh`
+- [x] CLI: `alps run "prompt"`
+- [x] **Per-task git branches** — `alps/<task-id>` per workdir, holds the per-run state
+- [x] **AGENTS.md propagation** — ralph `## Codebase Patterns` → task-level AGENTS.md → review/judge/next-plan
 
 ### Phase 2 — scale-out
 
-- Multi-task daemon (one task per slot, queue)
-- Pub/sub notifications to Kyle when Done (via Discord webhook)
-- Receipt aggregation dashboard
-- `MaxAttempts` and escalation policy
-- AGENTS.md / CLAUDE.md updates from implement step
-- Structured plan output (typed user stories, typed DOD)
+- [ ] Multi-task daemon (one task per slot, queue)
+- [ ] Pub/sub notifications to Kyle when Done (via Discord webhook)
+- [ ] Receipt aggregation dashboard
+- [ ] `MaxAttempts` and escalation policy
+- [x] ~~AGENTS.md / CLAUDE.md updates from implement step~~ (landed early in `f452ca3`)
+- [x] ~~Structured plan output (typed user stories, typed DoD)~~ (landed in `a36978f`)
+- [ ] **Rust DoD path** — `DoDRunner` auto-detects Rust, runs `cargo test`. Code is there; never smoke-tested.
+- [ ] **Plan retry-on-parse-fail** — Plan agent sometimes emits invalid JSON (trailing commas). Currently a Plan failure kills the run. Should retry N times before failing.
 
 ### Phase 3 — advanced
 
-- Persistent task queue (SQLite)
-- Cross-task learning (reuse feedback patterns)
-- Web UI for monitoring
-- Multi-model judge (judge ensemble)
-- Per-task branches in git (one branch per task)
+- [ ] Persistent task queue (SQLite)
+- [ ] Cross-task learning (reuse feedback patterns)
+- [ ] Web UI for monitoring
+- [ ] Multi-model judge (judge ensemble)
+- [x] ~~Per-task branches in git (one branch per task)~~ (landed in `f452ca3`)
+- [ ] Cost ceiling per task (LLM Judge + Plan + Review add up fast on a "brute force" reject cycle)
+- [ ] CI (GitHub Actions on `klampatech/alps`)
+- [ ] Mock-agent test coverage for happy path + multi-iteration reject cycles
 
 ## 10. Agent integrations
 
@@ -761,6 +806,24 @@ file is the durable artifact for downstream tooling.
 
 ### 11.5 Deferred (Phase 2+)
 
-- Per-task branches (currently single main with date-stamped commits)
-- AGENTS.md / CLAUDE.md propagation from implement step
-- Agent test fixtures (mock CLIs vs recorded fixtures)
+- ~~Per-task branches (currently single main with date-stamped commits)~~ — landed in `f452ca3`
+- ~~AGENTS.md / CLAUDE.md propagation from implement step~~ — landed in `f452ca3`
+- Agent test fixtures (mock CLIs vs recorded fixtures) — partial; `for_test` constructors landed in `731fbd3` but the prompt mentioned "fixtures vs recorded" — recorded-replay fixtures still open
+- Workdir-level guard against the wrapping agent re-invoking alps — landed in `46327b4`
+
+## 12. Next work (prioritized)
+
+This is the live roadmap as of 2026-07-27. Items in **bold** are
+load-bearing for "ALPS works" claims. Items below the line are
+quality-of-life or scale concerns.
+
+1. **Rust DoD path** — `DoDRunner` auto-detects Rust and runs `cargo test`, but every smoke so far was Python. Need at least one Rust smoke (e.g., "add a `add(a,b)` function and a `#[test]`) to confirm the path actually works. ~30 min including smoke.
+2. **Plan retry-on-parse-fail** — Plan agent occasionally emits invalid JSON (trailing comma observed in smoke9 at 2026-07-27 16:28). Currently a Plan failure exits with `AlpsError`; the run dies. Should retry N=2 times before failing. ~1 hour.
+3. **Real reject-path smoke** — the unit test (`drive_rejects_then_passes_appends_feedback_to_next_plan`) verifies the orchestration deterministically, but we've never actually seen a real smoke reject and recover. Need a prompt that reliably makes the structured DoD fail (e.g., specify a test that the implementer will get wrong) so the full pipeline exercises the restart. Hard part: codex is too smart for typical "gotcha" prompts.
+4. **Multi-iteration ralph** — every smoke completed in 1-2 ralph iterations. The "20-iteration safety net" path (ralph hits `MAX_ITERATIONS` without `<promise>COMPLETE</promise>`) is unverified. Should test a prompt that needs at least 5 stories.
+5. **Spec §2.1 / §5.3 sync** — the implementation has drifted from the spec in a few places (per-task branches are now §4 state, not §3 deferred; the agent trait is still sealed; etc.). The spec is now ahead of the code in some areas and behind in others. Worth a top-to-bottom pass once the bug-bash is done.
+6. **Mock-agent happy-path test** — we have the reject-path test; the happy path is still only smoke-tested. Adding `drive_passes_first_try` (Plan/Implement/Review/Judge all return canned values, verify Ok(done) on first call) would close the symmetric gap.
+7. **CI** — no GitHub Actions on `klampatech/alps`. The 90 tests run locally only. ~30 min to set up.
+8. **alps-source `AGENTS.md` / `CLAUDE.md`** — when alps runs against itself, the workdir-level AGENTS.md starts empty. Worth seeding the alps source repo with project conventions.
+9. **Cost ceiling** — "brute force" + LLM Judge = real money on a multi-reject cycle. Add a per-task USD cap that exits with `AlpsError` if exceeded.
+10. **More DoD project types** — currently Python + Rust. Add Node (`npm test`?), Go (`go test`?). 1-2 hours each.
