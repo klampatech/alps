@@ -822,7 +822,7 @@ This is the live roadmap as of 2026-07-27. Items in **bold** are
 load-bearing for "ALPS works" claims. Items below the line are
 quality-of-life or scale concerns.
 
-1. **Rust DoD path** — `DoDRunner` auto-detects Rust and runs `cargo test`, but every smoke so far was Python. Need at least one Rust smoke (e.g., "add a `add(a,b)` function and a `#[test]`) to confirm the path actually works. ~30 min including smoke.
+1. **[→ NEXT] Rust DoD path** — `DoDRunner` auto-detects Rust and runs `cargo test`, but every smoke so far was Python. Need at least one Rust smoke (e.g., "add a `add(a,b)` function and a `#[test]`) to confirm the path actually works. ~30 min including smoke.
 2. **Real reject-path smoke** — the unit test (`drive_rejects_then_passes_appends_feedback_to_next_plan`) verifies the orchestration deterministically, and smoke9 demonstrated partial-progress-routes-to-Judge in production, but we've never seen a smoke complete via the reject path (Judge reject → Plan revise → re-implement → Judge pass). Need a prompt that reliably makes the structured DoD fail in a way that the implementer can fix on the next iteration. Hard part: codex is too smart for typical "gotcha" prompts.
 3. **Spec §2.1 / §5.3 sync** — the implementation has drifted from the spec in a few places (per-task branches are now §4 state, not §3 deferred; the agent trait is still sealed; etc.). The spec is now ahead of the code in some areas and behind in others. Worth a top-to-bottom pass once the bug-bash is done.
 4. **Mock-agent happy-path test** — we have the reject-path test; the happy path is still only smoke-tested. Adding `drive_passes_first_try` (Plan/Implement/Review/Judge all return canned values, verify Ok(done) on first call) would close the symmetric gap.
