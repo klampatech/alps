@@ -516,56 +516,103 @@ fn read_commits(ralph_dir: &Path) -> Result<Vec<Commit>, ImplementError> {
     Ok(commits)
 }
 
+// Files we added ourselves — kept out of the artifacts list so they
+// don't pollute the Judge's review prompt.
+const SKIP_FILES: &[&str] = &[
+    "ralph.sh",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "prd.json",
+    "progress.txt",
+    ".codex-last-message.txt",
+    ".ralph-result.json",
+    ".last-branch",
+];
+
+// Directories whose contents are noise (build output, caches, VCS metadata).
+// Skipped during recursive walk to keep the artifacts list lean and avoid
+// surfacing `target/debug/foo.rlib` etc. to the LLM Judge.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".gradle",
+    ".cargo",
+];
+
+/// Collect every source file under `ralph_dir` recursively. The previous
+/// implementation was non-recursive (`std::fs::read_dir`), which meant
+/// Rust `src/lib.rs`, Go `pkg/foo.go`, etc. were never picked up — the
+/// LLM Judge then rejected the smoke on "Source files section omits
+/// src/lib.rs entirely" (verified 2026-07-27 in the Rust DoD smoke, see
+/// SPEC.md §12 item 1). Now we walk the whole tree, skipping known
+/// noise directories.
 fn read_artifacts(ralph_dir: &Path) -> Result<Vec<Artifact>, ImplementError> {
     let mut artifacts = Vec::new();
-    let entries = std::fs::read_dir(ralph_dir)
-        .map_err(|e| ImplementError::RalphSetup(format!("read_dir: {}", e)))?;
+    walk_artifacts(ralph_dir, ralph_dir, &mut artifacts)?;
+    Ok(artifacts)
+}
 
-    // Skip files we added ourselves
-    const SKIP: &[&str] = &[
-        "ralph.sh",
-        "CLAUDE.md",
-        "AGENTS.md",
-        "prd.json",
-        "progress.txt",
-        ".codex-last-message.txt",
-        ".ralph-result.json",
-        ".last-branch",
-        ".git",
-    ];
+fn walk_artifacts(
+    root: &Path,
+    dir: &Path,
+    artifacts: &mut Vec<Artifact>,
+) -> Result<(), ImplementError> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| ImplementError::RalphSetup(format!("read_dir({:?}): {}", dir, e)))?;
 
     for entry in entries {
         let entry = entry.map_err(|e| ImplementError::RalphSetup(format!("entry: {}", e)))?;
         let path = entry.path();
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
-        if SKIP.contains(&name) || name.starts_with('.') {
+        if name.is_empty() {
             continue;
         }
 
-        let kind = if name.ends_with(".rs") || name.ends_with(".py") || name.ends_with(".js")
-            || name.ends_with(".ts") || name.ends_with(".go") {
-            ArtifactKind::Source
-        } else if name.ends_with("_test.rs") || name.ends_with(".test.") || name.ends_with("test_") {
-            ArtifactKind::Test
-        } else if name.ends_with(".md") {
-            ArtifactKind::Doc
-        } else if name.ends_with(".toml") || name.ends_with(".json") || name.ends_with(".yaml")
-            || name.ends_with(".yml") || name == "Cargo.lock" || name == "package.json" {
-            ArtifactKind::Config
-        } else {
-            ArtifactKind::Other(name.to_string())
-        };
+        if path.is_dir() {
+            if SKIP_DIRS.contains(&name) || name.starts_with('.') {
+                continue;
+            }
+            walk_artifacts(root, &path, artifacts)?;
+            continue;
+        }
 
+        if SKIP_FILES.contains(&name) || name.starts_with('.') {
+            continue;
+        }
+
+        let kind = classify_artifact_kind(name);
         let rel = path
-            .strip_prefix(ralph_dir)
+            .strip_prefix(root)
             .unwrap_or(&path)
             .to_path_buf();
 
         artifacts.push(Artifact { path: rel, kind });
     }
 
-    Ok(artifacts)
+    Ok(())
+}
+
+fn classify_artifact_kind(name: &str) -> ArtifactKind {
+    if name.ends_with(".rs") || name.ends_with(".py") || name.ends_with(".js")
+        || name.ends_with(".ts") || name.ends_with(".go") {
+        ArtifactKind::Source
+    } else if name.ends_with("_test.rs") || name.ends_with(".test.") || name.starts_with("test_") {
+        ArtifactKind::Test
+    } else if name.ends_with(".md") {
+        ArtifactKind::Doc
+    } else if name.ends_with(".toml") || name.ends_with(".json") || name.ends_with(".yaml")
+        || name.ends_with(".yml") || name == "Cargo.lock" || name == "package.json" {
+        ArtifactKind::Config
+    } else {
+        ArtifactKind::Other(name.to_string())
+    }
 }
 
 // Helper for the error chain
@@ -810,6 +857,81 @@ mod tests {
         assert!(artifacts.iter().any(|a| a.path == PathBuf::from("Cargo.toml")));
         assert!(artifacts.iter().any(|a| a.path == PathBuf::from("data.txt")));
         assert!(!artifacts.iter().any(|a| a.path.to_string_lossy().contains(".gitignore")));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn read_artifacts_recurses_into_subdirectories() {
+        // Regression: read_artifacts used to be non-recursive, so Rust
+        // `src/lib.rs` (and Go `pkg/foo.go`, etc.) were never picked up.
+        // The LLM Judge then rejected the smoke on "Source files section
+        // omits src/lib.rs entirely" (Rust DoD smoke, 2026-07-27, see
+        // SPEC.md §12 item 1). Walk must descend into all directories
+        // except known-noise ones (target/, .git/, node_modules/, etc.).
+        let tmp = std::env::temp_dir().join("alps-test-artifacts-recursive");
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("src")).unwrap();
+        std::fs::create_dir_all(tmp.join("tests")).unwrap();
+
+        // Real source tree (Rust layout)
+        std::fs::write(tmp.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+        std::fs::write(tmp.join("Cargo.lock"), "# cargo lock\n").unwrap();
+        std::fs::write(
+            tmp.join("src/lib.rs"),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join("src/test_add.rs"),
+            "#[test] fn t() { assert_eq!(super::add(2, 3), 5); }",
+        )
+        .unwrap();
+        std::fs::write(tmp.join("tests/integration.rs"), "// integration test\n").unwrap();
+
+        // Noise directories that must be skipped
+        std::fs::create_dir_all(tmp.join("target/debug")).unwrap();
+        std::fs::write(tmp.join("target/debug/libalps_smoke.rlib"), "binary").unwrap();
+        std::fs::create_dir_all(tmp.join(".git")).unwrap();
+        std::fs::write(tmp.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::create_dir_all(tmp.join("node_modules/lodash")).unwrap();
+        std::fs::write(tmp.join("node_modules/lodash/index.js"), "module.exports = {};\n").unwrap();
+
+        let artifacts = read_artifacts(&tmp).unwrap();
+
+        // Must include files from subdirectories
+        assert!(
+            artifacts.iter().any(|a| a.path == PathBuf::from("src/lib.rs")),
+            "expected src/lib.rs in artifacts, got: {:?}",
+            artifacts.iter().map(|a| &a.path).collect::<Vec<_>>()
+        );
+        assert!(artifacts.iter().any(|a| a.path == PathBuf::from("src/test_add.rs")));
+        assert!(artifacts.iter().any(|a| a.path == PathBuf::from("tests/integration.rs")));
+
+        // Top-level still works
+        assert!(artifacts.iter().any(|a| a.path == PathBuf::from("Cargo.toml")));
+        assert!(artifacts.iter().any(|a| a.path == PathBuf::from("Cargo.lock")));
+
+        // Noise dirs are excluded
+        let paths: Vec<String> = artifacts
+            .iter()
+            .map(|a| a.path.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !paths.iter().any(|p| p.contains("target")),
+            "target/ leaked into artifacts: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains(".git")),
+            ".git/ leaked into artifacts: {:?}",
+            paths
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("node_modules")),
+            "node_modules/ leaked into artifacts: {:?}",
+            paths
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
