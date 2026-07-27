@@ -79,6 +79,7 @@ fn run_iteration<'a>(
         // ── Judge ──
         eprintln!("[judge] running");
         let ctx = JudgeContext {
+            task_id: task.id.clone(),
             plan: task.state.plan.clone(),
             implementation: task.state.implementation.clone(),
             review: task.state.review.clone(),

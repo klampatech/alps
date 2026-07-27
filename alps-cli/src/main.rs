@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use alps_core::domain::{Prompt, TaskId};
 use alps_core::implement::ImplementAgent;
-use alps_core::judge::{AlwaysPassLlm, AlwaysPassStructured, JudgeAgent};
+use alps_core::judge::{AlwaysPassStructured, HermesLlmJudge, JudgeAgent};
 use alps_core::loop_::drive;
 use alps_core::persistence::TaskWorkspace;
 use alps_core::plan::PlanAgent;
@@ -118,7 +118,7 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
     let review = ReviewAgent::default();
     let judge = JudgeAgent::new(
         Arc::new(AlwaysPassStructured),
-        Arc::new(AlwaysPassLlm),
+        Arc::new(HermesLlmJudge::default()),
     );
 
     match drive(task, &plan, &implement, &review, &judge, &workspace).await {
