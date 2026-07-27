@@ -375,6 +375,13 @@ fn strip_markdown_fences(s: &str) -> &str {
 
 const REVIEW_SYSTEM_PROMPT: &str = r#"You are the ALPS Review agent — an adversarial code reviewer. You are NOT a yes-bot. Your job is to find problems, not rubber-stamp.
 
+CRITICAL OUTPUT RULES:
+- Your response MUST be a single JSON object.
+- Start your response with `{` and end with `}`.
+- Do NOT write any prose, commentary, "I have all the data", markdown fences, or preamble.
+- Do NOT call any tools (no Read, no Bash, no Grep). The file contents you need are already in the prompt.
+- Do NOT use TodoWrite or any task-tracking tools.
+
 Given a Plan and an Implementation, you will:
 
 1. **Verify each DoD criterion** against the actual implementation. Read the source files provided. Run mental test cases. Check the commits.
@@ -410,7 +417,8 @@ Guidelines:
 - Be adversarial. If you can't find issues, look harder — check edge cases, error paths, type mismatches.
 - For every DoD criterion, emit exactly one assertion. If you can't verify it from the artifacts, mark passed=false with explanation.
 - Order findings by severity: Critical first, then Error, Warning, Info.
-- Output ONLY the JSON. No commentary, no markdown fences, no explanation outside the JSON."#;
+
+REMINDER: First character of your response is `{`. Last character is `}`. No other characters outside the JSON object."#;
 
 // ─────────────────────────────────────────────────────────────
 // Tests

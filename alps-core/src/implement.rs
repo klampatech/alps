@@ -225,7 +225,9 @@ struct RalphStory {
     description: String,
     #[serde(rename = "acceptanceCriteria")]
     acceptance_criteria: Vec<String>,
+    #[serde(default)]
     priority: u32,
+    #[serde(default)]
     passes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notes: Option<String>,

@@ -17,7 +17,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
@@ -486,6 +486,13 @@ const JUDGE_SYSTEM_PROMPT: &str = r#"You are the ALPS Judge — the final arbite
 
 You are NOT a yes-bot. You are decisive. Don't waffle.
 
+CRITICAL OUTPUT RULES:
+- Your response MUST be a single JSON object.
+- Start your response with `{` and end with `}`.
+- Do NOT write any prose, commentary, "I have all the data", markdown fences, or preamble.
+- Do NOT call any tools (no Read, no Bash, no Grep). All needed data is in the prompt.
+- Do NOT use TodoWrite or any task-tracking tools.
+
 Given:
 - The Plan (goal, DoD criteria)
 - The Implementation (commits, source files)
@@ -523,11 +530,226 @@ Output ONLY valid JSON:
   "retry_hints": ["string — actionable suggestion", ...]
 }
 
-Output ONLY the JSON. No commentary, no markdown fences, no explanation outside the JSON."#;
+REMINDER: First character of your response is `{`. Last character is `}`. No other characters outside the JSON object."#;
+
+// =================== DoD Runner (real) ===================
+
+/// Config for the DoD runner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoDRunnerConfig {
+    /// Auto-detect project type from files in the ralph dir.
+    pub auto_detect: bool,
+    /// Per-command timeout in seconds.
+    pub timeout_secs: u64,
+    /// Skip all verification (useful for testing).
+    pub skip_verification: bool,
+}
+
+impl Default for DoDRunnerConfig {
+    fn default() -> Self {
+        DoDRunnerConfig {
+            auto_detect: true,
+            timeout_secs: 120,
+            skip_verification: false,
+        }
+    }
+}
+
+/// Detected project type — drives the test command selection.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum ProjectType {
+    Rust,
+    Python,
+    Node,
+    Go,
+    Unknown,
+}
+
+impl std::fmt::Display for ProjectType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ProjectType::Rust => write!(f, "rust"),
+            ProjectType::Python => write!(f, "python"),
+            ProjectType::Node => write!(f, "node"),
+            ProjectType::Go => write!(f, "go"),
+            ProjectType::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Real StructuredJudge — runs verifiable DoD checks by spawning the
+/// project's test command (cargo test / pytest / npm test / go test).
+pub struct DoDRunner {
+    pub config: DoDRunnerConfig,
+}
+
+impl DoDRunner {
+    pub fn new() -> Self {
+        DoDRunner { config: DoDRunnerConfig::default() }
+    }
+
+    pub fn with_config(config: DoDRunnerConfig) -> Self {
+        DoDRunner { config }
+    }
+}
+
+impl Default for DoDRunner {
+    fn default() -> Self {
+        DoDRunner::new()
+    }
+}
+
+#[async_trait]
+impl StructuredJudge for DoDRunner {
+    async fn check(&self, ctx: &JudgeContext) -> Result<StructuredResult, JudgeError> {
+        if self.config.skip_verification {
+            return Ok(StructuredResult { all_pass: true, failed: vec![] });
+        }
+
+        let ralph_dir = ctx.implementation.prd_path.parent().ok_or(
+            JudgeError::Structured(format!(
+                "prd_path has no parent: {:?}",
+                ctx.implementation.prd_path
+            )),
+        )?;
+
+        if !self.config.auto_detect {
+            return Ok(StructuredResult { all_pass: true, failed: vec![] });
+        }
+
+        let project_type = detect_project_type(ralph_dir);
+        eprintln!("[judge:structured] detected project type: {}", project_type);
+
+        if matches!(project_type, ProjectType::Unknown) {
+            eprintln!("[judge:structured] no project type detected, skipping DoD checks");
+            return Ok(StructuredResult { all_pass: true, failed: vec![] });
+        }
+
+        let (cmd, args) = test_command_for(&project_type);
+        eprintln!("[judge:structured] running: {} {}", cmd, args.join(" "));
+
+        let result = run_cmd_with_timeout(ralph_dir, cmd, &args, self.config.timeout_secs).await?;
+
+        if result.success {
+            eprintln!("[judge:structured] PASS");
+            Ok(StructuredResult { all_pass: true, failed: vec![] })
+        } else {
+            eprintln!(
+                "[judge:structured] FAIL (exit {:?})",
+                result.exit_code
+            );
+            Ok(StructuredResult {
+                all_pass: false,
+                failed: vec![Assertion {
+                    criterion: format!("DoD check: {} {}", cmd, args.join(" ")),
+                    passed: false,
+                    evidence: format!(
+                        "exit {:?}
+--- stderr ---
+{}
+--- end ---",
+                        result.exit_code,
+                        result.stderr.chars().take(1000).collect::<String>()
+                    ),
+                }],
+            })
+        }
+    }
+}
+
+fn detect_project_type(dir: &Path) -> ProjectType {
+    if dir.join("Cargo.toml").exists() || dir.join("Cargo.lock").exists() {
+        return ProjectType::Rust;
+    }
+    if dir.join("pyproject.toml").exists()
+        || dir.join("setup.py").exists()
+        || dir.join("pytest.ini").exists()
+        || dir.join("pyproject.toml").exists()
+        || has_py_tests(dir)
+    {
+        return ProjectType::Python;
+    }
+    if dir.join("package.json").exists() {
+        return ProjectType::Node;
+    }
+    if dir.join("go.mod").exists() {
+        return ProjectType::Go;
+    }
+    ProjectType::Unknown
+}
+
+fn has_py_tests(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .any(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    name.starts_with("test_") && name.ends_with(".py")
+                })
+        })
+        .unwrap_or(false)
+}
+
+fn test_command_for(project_type: &ProjectType) -> (&'static str, Vec<&'static str>) {
+    match project_type {
+        ProjectType::Rust => ("cargo", vec!["test", "--quiet"]),
+        ProjectType::Python => ("python3", vec!["-m", "pytest", "-q"]),
+        ProjectType::Node => ("npm", vec!["test", "--silent"]),
+        ProjectType::Go => ("go", vec!["test", "./..."]),
+        ProjectType::Unknown => ("", vec![]),
+    }
+}
+
+struct CmdResult {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+async fn run_cmd_with_timeout(
+    dir: &Path,
+    cmd: &str,
+    args: &[&str],
+    timeout_secs: u64,
+) -> Result<CmdResult, JudgeError> {
+    if cmd.is_empty() {
+        return Ok(CmdResult {
+            success: true,
+            exit_code: Some(0),
+            stdout: String::new(),
+            stderr: String::new(),
+        });
+    }
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(timeout_secs),
+        Command::new(cmd).args(args).current_dir(dir).output(),
+    )
+    .await
+    .map_err(|_| {
+        JudgeError::Structured(format!(
+            "timeout after {}s running '{} {}'",
+            timeout_secs,
+            cmd,
+            args.join(" ")
+        ))
+    })?
+    .map_err(|e| JudgeError::Structured(format!("spawn failed: {}", e)))?;
+
+    Ok(CmdResult {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
 
 // =================== Stubs (for MVP / testing) ===================
 
-/// MVP stub: structured check always passes.
+/// Stub that always passes. Kept for tests + as a fallback option.
 pub struct AlwaysPassStructured;
 
 #[async_trait]
@@ -770,6 +992,143 @@ mod tests {
         match result {
             Judgment::Pass(receipts) => assert_eq!(receipts.task_id, expected_id),
             _ => panic!("expected Pass"),
+        }
+    }
+
+    // ── DoD Runner tests ──
+
+    fn make_tmp_dir() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("alps-dod-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn detect_rust_project() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Rust);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_python_project_via_pyproject() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_python_project_via_pytest_ini() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("pytest.ini"), "[pytest]").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_python_project_via_test_files() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("test_foo.py"), "def test_x(): pass").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_node_project() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Node);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_go_project() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("go.mod"), "module foo").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Go);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_unknown_project() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("README.md"), "# readme").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Unknown);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn has_py_tests_finds_test_py() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("test_foo.py"), "").unwrap();
+        std::fs::write(dir.join("bar.py"), "").unwrap();
+        assert!(has_py_tests(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn has_py_tests_no_test_py() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("foo.py"), "").unwrap();
+        std::fs::write(dir.join("bar.py"), "").unwrap();
+        assert!(!has_py_tests(&dir));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_command_for_each_type() {
+        assert_eq!(test_command_for(&ProjectType::Rust), ("cargo", vec!["test", "--quiet"]));
+        assert_eq!(test_command_for(&ProjectType::Python), ("python3", vec!["-m", "pytest", "-q"]));
+        assert_eq!(test_command_for(&ProjectType::Node), ("npm", vec!["test", "--silent"]));
+        assert_eq!(test_command_for(&ProjectType::Go), ("go", vec!["test", "./..."]));
+        assert_eq!(test_command_for(&ProjectType::Unknown), ("", vec![]));
+    }
+
+    #[test]
+    fn project_type_display() {
+        assert_eq!(format!("{}", ProjectType::Rust), "rust");
+        assert_eq!(format!("{}", ProjectType::Python), "python");
+        assert_eq!(format!("{}", ProjectType::Node), "node");
+        assert_eq!(format!("{}", ProjectType::Go), "go");
+        assert_eq!(format!("{}", ProjectType::Unknown), "unknown");
+    }
+
+    #[tokio::test]
+    async fn dod_runner_skip_verification_passes() {
+        let runner = DoDRunner::with_config(DoDRunnerConfig {
+            skip_verification: true,
+            ..Default::default()
+        });
+        let result = runner.check(&dummy_ctx()).await.unwrap();
+        assert!(result.all_pass);
+        assert!(result.failed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dod_runner_unknown_project_skips() {
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("README.md"), "# readme").unwrap();
+        let ctx = JudgeContext {
+            implementation: crate::domain::Implementation {
+                prd_path: dir.join("prd.json"),
+                ..impl_dummy()
+            },
+            ..dummy_ctx()
+        };
+        let runner = DoDRunner::new();
+        let result = runner.check(&ctx).await.unwrap();
+        assert!(result.all_pass);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn impl_dummy() -> crate::domain::Implementation {
+        crate::domain::Implementation {
+            ralph_branch: "alps/test".to_string(),
+            prd_path: PathBuf::from("/tmp/prd.json"),
+            commits: vec![],
+            artifacts: vec![],
         }
     }
 }
