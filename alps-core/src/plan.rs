@@ -47,6 +47,11 @@ impl Default for PlanConfig {
 /// parses the JSON output, and returns a typed `Plan`.
 pub struct PlanAgent {
     pub config: PlanConfig,
+    /// Test-only override: when set, `run()` calls this closure instead of
+    /// spawning Claude Code. Used by `drive_*` integration tests in
+    /// `loop_::tests` to deterministically exercise the orchestration.
+    #[cfg(test)]
+    pub(crate) test_handler: Option<std::sync::Arc<dyn Fn(Prompt) -> Result<Plan, PlanError> + Send + Sync>>,
 }
 
 impl PlanAgent {
@@ -56,11 +61,30 @@ impl PlanAgent {
                 model: model.into(),
                 ..Default::default()
             },
+            #[cfg(test)]
+            test_handler: None,
         }
     }
 
     pub fn with_config(config: PlanConfig) -> Self {
-        PlanAgent { config }
+        PlanAgent {
+            config,
+            #[cfg(test)]
+            test_handler: None,
+        }
+    }
+
+    /// Test-only constructor that bypasses Claude Code. The closure receives
+    /// the input prompt and returns a canned (or computed) `Plan`.
+    #[cfg(test)]
+    pub fn for_test<F>(f: F) -> Self
+    where
+        F: Fn(Prompt) -> Result<Plan, PlanError> + Send + Sync + 'static,
+    {
+        PlanAgent {
+            config: PlanConfig::default(),
+            test_handler: Some(std::sync::Arc::new(f)),
+        }
     }
 }
 
@@ -83,6 +107,14 @@ impl Agent for PlanAgent {
     }
 
     async fn run(&self, input: Prompt) -> Result<Self::Output, Self::Error> {
+        // Test-only fast path: if a test_handler is set, use it instead of
+        // spawning Claude Code. This lets integration tests in `loop_::tests`
+        // exercise the orchestration deterministically.
+        #[cfg(test)]
+        if let Some(f) = &self.test_handler {
+            return f(input);
+        }
+
         // Build the full prompt: system prompt + user prompt.
         // If the prompt contains a "Previous attempt rejected" section (added
         // by Task<Rejected>::reset()), the system prompt instructs Claude to

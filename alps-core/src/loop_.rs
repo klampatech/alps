@@ -247,4 +247,256 @@ mod tests {
         let wrapped = wrap_prompt_with_agents_md(&p, "");
         assert_eq!(wrapped.as_str(), p.as_str());
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // drive_* integration tests — verify the reject-resubmit cycle.
+    //
+    // These use the for_test constructors on the 4 agents (cfg(test) only)
+    // to deterministically exercise run_iteration's recursion on Judge
+    // Reject without spawning real Claude/Codex. The key invariant:
+    // when the Judge rejects, the next iteration's Plan prompt must
+    // contain the feedback from the rejection.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use crate::domain::{
+        Assertion, Artifact, Commit, DefinitionOfDone, Feedback, Finding, Implementation,
+        Judgment, Plan, PlanId, Review, Severity, StoryId, TaskId, UserStory,
+    };
+    use crate::implement::ImplementAgent;
+    use crate::judge::{
+        JudgeAgent, JudgeContext, JudgeError, LlmJudge, StructuredJudge, StructuredResult,
+    };
+    use crate::plan::PlanAgent;
+    use crate::receipt::{ImplementMetrics, Receipts, ReviewSummary};
+    use crate::review::{ReviewAgent, ReviewContext};
+    use std::sync::{Arc, Mutex};
+
+    /// A canned Plan that matches a "build a Python function" prompt.
+    fn canned_plan(plan_id: PlanId) -> Plan {
+        Plan {
+            id: plan_id,
+            goal: "Build the requested Python function".to_string(),
+            architecture: "Single module with one function".to_string(),
+            stories: vec![UserStory {
+                id: StoryId("US-001".to_string()),
+                title: "Implement the function".to_string(),
+                description: "Implement the requested function per spec".to_string(),
+                acceptance_criteria: vec!["function returns correct value".to_string()],
+                priority: 1,
+            }],
+            dod: vec![DefinitionOfDone {
+                criterion: "tests pass with pytest".to_string(),
+                verifiable: true,
+            }],
+        }
+    }
+
+    /// A canned Implementation that pairs with canned_plan.
+    fn canned_implementation(prd_path: std::path::PathBuf) -> Implementation {
+        Implementation {
+            ralph_branch: "alps/test".to_string(),
+            prd_path,
+            commits: vec![Commit {
+                sha: "abc123".to_string(),
+                message: "feat: implement".to_string(),
+            }],
+            artifacts: vec![Artifact {
+                path: "fib.py".into(),
+                kind: crate::domain::ArtifactKind::Other("python".to_string()),
+            }],
+            metrics: ImplementMetrics::default(),
+        }
+    }
+
+    /// A canned Review that always has 0 critical findings, 1 warning,
+    /// 1 passing assertion.
+    fn canned_review() -> Review {
+        Review {
+            findings: vec![Finding {
+                severity: Severity::Warning,
+                description: "docstring could be improved".to_string(),
+                evidence: "missing parameter docs".to_string(),
+            }],
+            assertions: vec![Assertion {
+                criterion: "tests pass".to_string(),
+                passed: true,
+                evidence: "pytest output".to_string(),
+            }],
+        }
+    }
+
+    /// Sequential LLM Judge that returns each pre-loaded Judgment in order.
+    /// After the queue is exhausted, it returns the last judgment.
+    /// Records every call so tests can verify call count + input ctx.
+    struct ScriptedLlmJudge {
+        script: Mutex<Vec<Judgment>>,
+        calls: Mutex<Vec<JudgeContext>>,
+    }
+
+    impl ScriptedLlmJudge {
+        fn new(script: Vec<Judgment>) -> Self {
+            Self {
+                script: Mutex::new(script),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmJudge for ScriptedLlmJudge {
+        async fn judge(&self, ctx: &JudgeContext) -> Result<Judgment, JudgeError> {
+            self.calls.lock().unwrap().push(ctx.clone());
+            let mut script = self.script.lock().unwrap();
+            if script.is_empty() {
+                // Should not happen in well-formed tests
+                Err(JudgeError::Llm("script exhausted".to_string()))
+            } else {
+                Ok(script.remove(0))
+            }
+        }
+    }
+
+    /// Always-pass structured judge.
+    struct AlwaysPassStructured;
+    #[async_trait::async_trait]
+    impl StructuredJudge for AlwaysPassStructured {
+        async fn check(&self, _ctx: &JudgeContext) -> Result<StructuredResult, JudgeError> {
+            Ok(StructuredResult {
+                all_pass: true,
+                failed: vec![],
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_rejects_then_passes_appends_feedback_to_next_plan() {
+        // ── Setup ──
+        let task_id = TaskId::new();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "alps-drive-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace_root_for_impl = workspace_root.clone();
+        let workspace = TaskWorkspace::new(&workspace_root);
+
+        // Track Plan invocations to verify the second Plan sees the feedback.
+        let plan_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let plan_calls_for_closure = plan_calls.clone();
+        let plan_id = PlanId(uuid::Uuid::new_v4());
+        let plan_id_for_closure = plan_id.clone();
+        let plan = PlanAgent::for_test(move |input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            plan_calls_for_closure
+                .lock()
+                .unwrap()
+                .push(input.as_str().to_string());
+            Ok(canned_plan(plan_id_for_closure.clone()))
+        });
+
+        // Implement just returns a canned implementation pointing at a fake
+        // prd.json (needed for the type but not actually read in this test).
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root_for_impl, move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        // Review returns the canned review (no critical findings).
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        // Judge: first call rejects, second call passes.
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id,
+            plan_summary: "Build the requested Python function".to_string(),
+            implement_metrics: ImplementMetrics::default(),
+            review_summary: ReviewSummary {
+                findings_count: 1,
+                critical_findings: 0,
+                assertions_passed: 1,
+                assertions_total: 1,
+            },
+            judged_at: chrono::Utc::now(),
+            judge_model: "mock".to_string(),
+        };
+        let reject_feedback = Feedback {
+            reason: "tests do not pass: 0 passed, 1 failed".to_string(),
+            failed_assertions: vec![Assertion {
+                criterion: "tests pass with pytest".to_string(),
+                passed: false,
+                evidence: "AssertionError: assert fib(10) == [...]".to_string(),
+            }],
+            retry_hints: vec!["fix the implementation so fib(10) matches the expected list".to_string()],
+        };
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![
+            Judgment::Reject(reject_feedback),
+            Judgment::Pass(pass_receipts),
+        ]));
+        let judge = JudgeAgent::new(Arc::new(AlwaysPassStructured), scripted.clone());
+
+        // ── Run ──
+        let task = Task::<crate::task::Idle>::new(
+            task_id,
+            workspace_root.clone(),
+            Prompt::new("Build a fib function"),
+        );
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+        let _ = std::fs::remove_dir_all(&workspace_root);
+
+        // ── Assert ──
+        // 1. drive() returned Ok(done) — the reject-resubmit cycle worked.
+        let done = result.expect("drive() should return Ok after reject→pass cycle");
+        // The type-state attempt counter resets on rejected.reset(), so we
+        // verify the iteration count via plan_calls instead. The Task<Done>
+        // attempts() reflects the FINAL iteration's attempt number, which
+        // here is 1 (from the second plan call).
+        let _ = done.attempts(); // smoke check that the accessor compiles
+
+        // 2. Judge was called exactly TWICE (once for the reject, once for the pass).
+        assert_eq!(scripted.call_count(), 2, "Judge should be called once per iteration");
+
+        // 3. Plan was called exactly TWICE — this is the key invariant
+        //    proving the loop recursed on the Judge Reject.
+        let plan_inputs = plan_calls.lock().unwrap();
+        assert_eq!(plan_inputs.len(), 2, "Plan should be called once per iteration");
+
+        // 4. The SECOND Plan's prompt must contain the feedback from the first reject.
+        let second_plan_prompt = &plan_inputs[1];
+        assert!(
+            second_plan_prompt.contains("Previous attempt rejected"),
+            "second Plan's prompt should contain rejection feedback, got: {}",
+            second_plan_prompt
+        );
+        assert!(
+            second_plan_prompt.contains("tests do not pass"),
+            "second Plan's prompt should contain the specific reason, got: {}",
+            second_plan_prompt
+        );
+        assert!(
+            second_plan_prompt.contains("fix the implementation"),
+            "second Plan's prompt should contain retry hints, got: {}",
+            second_plan_prompt
+        );
+        // The original prompt must still be there too (rejected.reset prepends feedback)
+        assert!(
+            second_plan_prompt.contains("Build a fib function"),
+            "second Plan's prompt should still contain the original prompt"
+        );
+
+        // 5. The FIRST Plan's prompt should NOT have the feedback (sanity).
+        let first_plan_prompt = &plan_inputs[0];
+        assert!(
+            !first_plan_prompt.contains("Previous attempt rejected"),
+            "first Plan's prompt should not have feedback (it was the original run)"
+        );
+    }
 }

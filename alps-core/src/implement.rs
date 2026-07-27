@@ -128,11 +128,36 @@ pub struct ImplementAgent {
     pub config: ImplementConfig,
     /// The workspace root (`tasks/<id>/`). Used to compute the Ralph working dir.
     pub workspace_root: PathBuf,
+    /// Test-only override: when set, `run()` calls this closure instead of
+    /// spawning Ralph. Used by `drive_*` integration tests in `loop_::tests`
+    /// to deterministically exercise the orchestration.
+    #[cfg(test)]
+    pub(crate) test_handler:
+        Option<std::sync::Arc<dyn Fn(Plan) -> Result<Implementation, ImplementError> + Send + Sync>>,
 }
 
 impl ImplementAgent {
     pub fn new(workspace_root: PathBuf, config: ImplementConfig) -> Self {
-        ImplementAgent { config, workspace_root }
+        ImplementAgent {
+            config,
+            workspace_root,
+            #[cfg(test)]
+            test_handler: None,
+        }
+    }
+
+    /// Test-only constructor that bypasses Ralph. The closure receives the
+    /// input plan and returns a canned (or computed) `Implementation`.
+    #[cfg(test)]
+    pub fn for_test<F>(workspace_root: PathBuf, f: F) -> Self
+    where
+        F: Fn(Plan) -> Result<Implementation, ImplementError> + Send + Sync + 'static,
+    {
+        ImplementAgent {
+            config: ImplementConfig::default(),
+            workspace_root,
+            test_handler: Some(std::sync::Arc::new(f)),
+        }
     }
 
     pub fn ralph_dir(&self) -> PathBuf {
@@ -162,6 +187,14 @@ impl Agent for ImplementAgent {
     }
 
     async fn run(&self, input: Plan) -> Result<Self::Output, Self::Error> {
+        // Test-only fast path: if a test_handler is set, use it instead of
+        // spawning Ralph. This lets integration tests in `loop_::tests`
+        // exercise the orchestration deterministically.
+        #[cfg(test)]
+        if let Some(f) = &self.test_handler {
+            return f(input);
+        }
+
         let ralph_dir = self.ralph_dir();
         let task_id = self.task_id();
 

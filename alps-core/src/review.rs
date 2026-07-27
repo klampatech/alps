@@ -70,11 +70,35 @@ impl Default for ReviewConfig {
 /// Review agent — adversarial review via Claude Code.
 pub struct ReviewAgent {
     pub config: ReviewConfig,
+    /// Test-only override: when set, `run()` calls this closure instead of
+    /// spawning Claude Code. Used by `drive_*` integration tests in
+    /// `loop_::tests` to deterministically exercise the orchestration.
+    #[cfg(test)]
+    pub(crate) test_handler: Option<
+        std::sync::Arc<dyn Fn(ReviewContext) -> Result<Review, ReviewError> + Send + Sync>,
+    >,
 }
 
 impl ReviewAgent {
     pub fn new(config: ReviewConfig) -> Self {
-        ReviewAgent { config }
+        ReviewAgent {
+            config,
+            #[cfg(test)]
+            test_handler: None,
+        }
+    }
+
+    /// Test-only constructor that bypasses Claude Code. The closure receives
+    /// the input context and returns a canned (or computed) `Review`.
+    #[cfg(test)]
+    pub fn for_test<F>(f: F) -> Self
+    where
+        F: Fn(ReviewContext) -> Result<Review, ReviewError> + Send + Sync + 'static,
+    {
+        ReviewAgent {
+            config: ReviewConfig::default(),
+            test_handler: Some(std::sync::Arc::new(f)),
+        }
     }
 }
 
@@ -97,6 +121,14 @@ impl Agent for ReviewAgent {
     }
 
     async fn run(&self, ctx: ReviewContext) -> Result<Self::Output, Self::Error> {
+        // Test-only fast path: if a test_handler is set, use it instead of
+        // spawning Claude Code. This lets integration tests in `loop_::tests`
+        // exercise the orchestration deterministically.
+        #[cfg(test)]
+        if let Some(f) = &self.test_handler {
+            return f(ctx);
+        }
+
         // 1. Read source files from the ralph_dir so Claude can see the code
         let files = read_files(&ctx.implementation, &self.config)?;
 
