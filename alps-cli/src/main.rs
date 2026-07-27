@@ -48,6 +48,13 @@ enum Command {
         /// Working directory (defaults to current directory).
         #[arg(long, default_value = ".")]
         workdir: String,
+
+        /// Bypass the workdir completion guard (allows re-invocation within
+        /// the 5-second debounce window after a previous successful run).
+        /// Use when you legitimately want to re-run immediately — e.g.,
+        /// the previous run completed but you want to try a different prompt.
+        #[arg(long)]
+        force: bool,
     },
 
     /// List tasks in the current workspace.
@@ -66,8 +73,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir } => {
-            run_task(prompt, workdir).await?;
+        Command::Run { prompt, workdir, force } => {
+            run_task(prompt, workdir, force).await?;
         }
         Command::List => {
             eprintln!("alps list: not yet implemented");
@@ -81,9 +88,53 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_task(prompt: String, workdir: String) -> Result<()> {
+async fn run_task(prompt: String, workdir: String, force: bool) -> Result<()> {
     let task_id = TaskId::new();
     let workdir = PathBuf::from(workdir);
+
+    // ── Workdir completion guard ──
+    // Refuse to start if a previous run completed in this workdir within the
+    // last 5 seconds. This is a defensive guard against the wrapping agent
+    // (e.g. Claude TUI in a herdr pane) auto-re-invoking alps after seeing
+    // "ALPS — Done" — observed 2026-07-27 in smoke6 (w9S:p1).
+    // Use --force to bypass for legitimate immediate re-runs.
+    use std::time::Duration;
+    match alps_core::workdir_guard::check_recent_completion(
+        &workdir,
+        Duration::from_secs(alps_core::workdir_guard::DEFAULT_THRESHOLD_SECS),
+    ) {
+        Ok(()) => {}
+        Err(alps_core::workdir_guard::WorkdirGuardError::RecentCompletion {
+            task_id: prev,
+            seconds_ago,
+            threshold_secs,
+        }) => {
+            if !force {
+                eprintln!(
+                    "error: recent completion in workdir — task {} completed {}s ago (threshold {}s).",
+                    prev, seconds_ago, threshold_secs
+                );
+                eprintln!(
+                    "       wrapping agent (Claude TUI / shell) may have re-invoked alps."
+                );
+                eprintln!(
+                    "       wait a few seconds, or pass --force to bypass this guard."
+                );
+                std::process::exit(2);
+            }
+            // --force: warn but proceed
+            eprintln!(
+                "warning: bypassing workdir guard (task {} completed {}s ago)",
+                prev, seconds_ago
+            );
+        }
+        Err(e) => {
+            // Other errors (malformed sentinel, IO) — warn but proceed.
+            // A malformed sentinel shouldn't block legitimate runs.
+            eprintln!("warning: workdir guard check failed: {}", e);
+        }
+    }
+
     let workspace_root = workdir.join("tasks").join(task_id.as_str());
     let workspace = TaskWorkspace::new(&workspace_root);
 
@@ -165,6 +216,17 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
 
             // Print markdown summary to stdout
             print_markdown(&done);
+
+            // Mark the workdir as having a recently completed task. This
+            // is the OTHER HALF of the workdir guard — combined with the
+            // check at startup, it prevents the wrapping agent (Claude TUI
+            // / shell) from auto-re-invoking alps within the debounce
+            // window after seeing "ALPS — Done" (observed 2026-07-27).
+            if let Err(e) =
+                alps_core::workdir_guard::mark_complete(&workdir, task_id.as_str())
+            {
+                eprintln!("warning: failed to mark workdir complete: {}", e);
+            }
 
             Ok(())
         }

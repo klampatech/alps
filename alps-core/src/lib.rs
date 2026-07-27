@@ -18,6 +18,7 @@ pub mod plan;
 pub mod receipt;
 pub mod review;
 pub mod task;
+pub mod workdir_guard;
 
 pub use agent::{Agent, EmptyInput, sealed};
 pub use domain::*;
