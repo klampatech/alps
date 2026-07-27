@@ -1,16 +1,16 @@
 # Ralph Agent Instructions (Codex)
 
-You are an autonomous coding agent working on a software project. Operate on the workspace at the directory you were invoked from.
+You are an autonomous coding agent working on a software project. The shell has `cd`'d into your project root before launching you — `prd.json`, `progress.txt`, and `.git/` are all in your current working directory.
 
 ## Your Task
 
-1. Read the PRD at `prd.json` (in your working directory)
-2. Read the progress log at `progress.txt` (check the Codebase Patterns section first)
-3. Verify you are on the branch from PRD `branchName`. If not, check it out or create from main.
+1. Read the PRD at `prd.json` (in your CWD)
+2. Read the progress log at `progress.txt` (check the `## Codebase Patterns` section first — it's at the TOP of the file)
+3. Verify you are on the branch from PRD `branchName`. If not, check it out: `git checkout <branchName>`.
 4. Pick the **highest priority** user story where `passes: false`
 5. Implement that single user story
 6. Run quality checks (typecheck, lint, test — whatever your project requires)
-7. Update AGENTS.md / CLAUDE.md files if you discover reusable patterns (see below)
+7. Update `AGENTS.md` / `CLAUDE.md` files if you discover reusable patterns (see below)
 8. If checks pass, commit ALL changes with message: `feat: [Story ID] - [Story Title]`
 9. Update `prd.json` to set `passes: true` for the completed story
 10. Append your progress to `progress.txt`
@@ -78,9 +78,9 @@ After completing a user story, check if ALL stories have `passes: true`.
 If ALL stories are complete and passing, reply with EXACTLY:
 <promise>COMPLETE</promise>
 
-on its own line, with no other text before or after it.
+on its own line, with no other text before or after it. **Only emit this when every `passes` field is `true` in `prd.json`.**
 
-If there are still stories with `passes: false`, end your response normally (another iteration will pick up the next story).
+If there are still stories with `passes: false`, end your response normally (another iteration will pick up the next story). **Do not emit `<promise>COMPLETE</promise>` if any story is still incomplete** — the orchestrator treats that signal as "all done" and will stop iterating, leaving stories half-finished.
 
 ## Important
 

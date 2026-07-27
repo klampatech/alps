@@ -169,7 +169,11 @@ impl Agent for ImplementAgent {
             "create_dir_all: {}", e
         )))?;
 
-        // ── 2. Initialize git repo ──
+        // ── 2. Initialize git repo (idempotent) ──
+        // Re-using the ralph dir across outer loop iterations is intentional —
+        // we want progress.txt and prior commits to survive. `git init` is a
+        // no-op if the dir is already a repo, and we use `git checkout` (not
+        // `-b`) for the branch step so retries don't blow up.
         run_git(&ralph_dir, &["init"])?;
         run_git(&ralph_dir, &["config", "user.email", "alps@local"])?;
         run_git(&ralph_dir, &["config", "user.name", "ALPS"])?;
@@ -184,24 +188,62 @@ impl Agent for ImplementAgent {
             &ralph_dir,
         )?;
 
-        // ── 4. Generate prd.json from Plan ──
+        // Write a sensible .gitignore so Ralph's auto-generated junk (pycache,
+        // node_modules, target/, etc.) doesn't pollute commits.
+        let gitignore = ralph_dir.join(".gitignore");
+        if !gitignore.exists() {
+            std::fs::write(
+                &gitignore,
+                "\
+__pycache__/
+*.pyc
+*.pyo
+node_modules/
+target/
+.DS_Store
+.venv/
+venv/
+",
+            )?;
+        }
+
+        // ── 4. Generate prd.json from Plan (always rewrite — plan may have been updated) ──
         let prd = plan_to_prd(&task_id, &input);
         let prd_json = serde_json::to_string_pretty(&prd)?;
         std::fs::write(ralph_dir.join("prd.json"), prd_json)?;
 
-        // ── 5. Initialize progress.txt ──
-        std::fs::write(ralph_dir.join("progress.txt"), "## Codebase Patterns\n")?;
+        // ── 5. Initialize progress.txt ONLY on first run (preserve across retries) ──
+        let progress_path = ralph_dir.join("progress.txt");
+        if !progress_path.exists() {
+            std::fs::write(&progress_path, "## Codebase Patterns\n")?;
+        }
 
         // ── 6. Optional init command ──
         if let Some(cmd) = &self.config.init_command {
             run_shell(&ralph_dir, cmd).await?;
         }
 
-        // ── 7. Initial commit on main, then branch ──
-        run_git(&ralph_dir, &["add", "-A"])?;
-        run_git(&ralph_dir, &["commit", "-m", "alps: initial setup"])?;
+        // ── 7. Initial commit on main, then branch (idempotent) ──
+        // First commit: only if there's no commit yet on main. If we re-enter,
+        // the previous run's commits and branch are already there.
         let branch = prd.branch_name.clone();
-        run_git(&ralph_dir, &["checkout", "-b", &branch])?;
+        let branch_exists = run_git(&ralph_dir, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch)])
+            .is_ok();
+
+        if !branch_exists {
+            // Check whether we have any commits at all
+            let has_commits = run_git(&ralph_dir, &["rev-parse", "--verify", "--quiet", "HEAD"]).is_ok();
+            if !has_commits {
+                run_git(&ralph_dir, &["add", "-A"])?;
+                run_git(&ralph_dir, &["commit", "-m", "alps: initial setup"])?;
+            }
+            // Make sure we're on main before creating the branch
+            run_git(&ralph_dir, &["checkout", "main"]).or_else(|_| run_git(&ralph_dir, &["checkout", "-b", "main"]))?;
+            run_git(&ralph_dir, &["checkout", "-b", &branch])?;
+        } else {
+            // Branch exists from a prior iteration — just switch to it
+            run_git(&ralph_dir, &["checkout", &branch])?;
+        }
 
         // ── 8. Invoke Ralph ──
         eprintln!(

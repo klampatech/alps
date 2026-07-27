@@ -95,9 +95,12 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee /dev/stderr) || true
   else
     # Codex: --dangerously-bypass-approvals-and-sandbox = full autonomous mode.
-    # -C "$SCRIPT_DIR" sets the workspace root so codex operates on the ralph dir.
+    # We cd into SCRIPT_DIR first so codex's process cwd is the ralph workspace
+    # (codex's -C flag sets the *agent* working root but not necessarily the
+    # process cwd that exec_command sees; running `cd` first is bulletproof).
     # The prompt is fed via stdin from AGENTS.md (codex reads from stdin when no arg is given).
-    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -C "$SCRIPT_DIR" < "$SCRIPT_DIR/AGENTS.md" 2>&1 | tee /dev/stderr) || true
+    cd "$SCRIPT_DIR" || { echo "codex: failed to cd to $SCRIPT_DIR" >&2; exit 1; }
+    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox < "$SCRIPT_DIR/AGENTS.md" 2>&1 | tee /dev/stderr) || true
   fi
   
   # Check for completion signal
