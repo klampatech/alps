@@ -38,6 +38,11 @@ PRD_FILE="$SCRIPT_DIR/prd.json"
 PROGRESS_FILE="$SCRIPT_DIR/progress.txt"
 ARCHIVE_DIR="$SCRIPT_DIR/archive"
 LAST_BRANCH_FILE="$SCRIPT_DIR/.last-branch"
+# Codex writes its final assistant message here so the COMPLETE-signal grep
+# doesn't false-positive on the prompt text (which mentions <promise>COMPLETE
+# as instructions). Without this, the first iteration always matches the
+# prompt echo and Ralph exits prematurely.
+CODEX_LAST_MESSAGE="$SCRIPT_DIR/.codex-last-message.txt"
 
 # Archive previous run if branch changed
 if [ -f "$PRD_FILE" ] && [ -f "$LAST_BRANCH_FILE" ]; then
@@ -97,19 +102,29 @@ for i in $(seq 1 $MAX_ITERATIONS); do
     # Codex: --dangerously-bypass-approvals-and-sandbox = full autonomous mode.
     # The implement agent invokes ralph.sh with current_dir = the ralph workspace
     # (tasks/<id>/implementation/ralph/), so our process cwd IS the ralph dir.
-    # We feed AGENTS.md from the ralph dir (not $SCRIPT_DIR) so the prompt file
-    # codex sees matches the project state in cwd.
+    # -o writes the FINAL assistant message to a file, separate from the
+    #   streaming output. We use that file for the COMPLETE-signal grep below
+    #   to avoid false-positives on the prompt text (which itself contains
+    #   "<promise>COMPLETE</promise>" as instructions).
     RALPH_AGENTS="$(pwd)/AGENTS.md"
     if [[ ! -f "$RALPH_AGENTS" ]]; then
-      # Fallback: source AGENTS.md in alps/scripts/. Identical content, but
-      # this path means the ralph dir wasn't set up correctly.
       RALPH_AGENTS="$SCRIPT_DIR/AGENTS.md"
     fi
-    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox < "$RALPH_AGENTS" 2>&1 | tee /dev/stderr) || true
+    rm -f "$CODEX_LAST_MESSAGE"
+    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -o "$CODEX_LAST_MESSAGE" < "$RALPH_AGENTS" 2>&1 | tee /dev/stderr) || true
   fi
   
   # Check for completion signal
-  if echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+  # For codex: grep the final-message file (avoids prompt-text false-positive).
+  # For claude/amp: grep the streaming output (their --print mode doesn't echo the prompt).
+  if [[ "$TOOL" == "codex" && -f "$CODEX_LAST_MESSAGE" ]]; then
+    if grep -q "<promise>COMPLETE</promise>" "$CODEX_LAST_MESSAGE"; then
+      echo ""
+      echo "Ralph completed all tasks!"
+      echo "Completed at iteration $i of $MAX_ITERATIONS"
+      exit 0
+    fi
+  elif echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
     echo ""
     echo "Ralph completed all tasks!"
     echo "Completed at iteration $i of $MAX_ITERATIONS"

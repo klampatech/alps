@@ -465,7 +465,15 @@ fn read_artifacts(ralph_dir: &Path) -> Result<Vec<Artifact>, ImplementError> {
         .map_err(|e| ImplementError::RalphSetup(format!("read_dir: {}", e)))?;
 
     // Skip files we added ourselves
-    const SKIP: &[&str] = &["ralph.sh", "CLAUDE.md", "AGENTS.md", "prd.json", "progress.txt", ".git"];
+    const SKIP: &[&str] = &[
+        "ralph.sh",
+        "CLAUDE.md",
+        "AGENTS.md",
+        "prd.json",
+        "progress.txt",
+        ".codex-last-message.txt",
+        ".git",
+    ];
 
     for entry in entries {
         let entry = entry.map_err(|e| ImplementError::RalphSetup(format!("entry: {}", e)))?;
