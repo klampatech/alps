@@ -1,6 +1,6 @@
 # ALPS — Specification
 
-> **Status**: v0.1 implemented + working; reject path verified
+> **Status**: v0.1 implemented + working; reject path verified; plan retry-on-parse-fail added
 > **Author**: Kyle + Evo
 > **Date**: 2026-07-26 (initial); 2026-07-27 (updated for v0.1 implementation)
 
@@ -27,6 +27,7 @@ what landed in `klampatech/alps` between the spec and now.
 | 2026-07-27 | `46327b4` | **Workdir completion guard** — refuses re-invocation within 5s of a prior success (defensive guard against Claude TUI auto-re-running alps; `--force` bypass) |
 | 2026-07-27 | `6ebaf92` | **Nested git repo exclusion** — `commit_smart` writes `<workdir>/.git/info/exclude` so the ralph nested `.git/` doesn't fatal `git add -A` on git 2.42+ |
 | 2026-07-27 | `731fbd3` | **Reject path verification** — `for_test` mock-agent infrastructure + `drive_rejects_then_passes_appends_feedback_to_next_plan` integration test (deterministic, <100ms) |
+| 2026-07-27 | `6a414a8` | **Plan retry-on-parse-fail** — `PlanAgent::run` retries up to `max_retries=3` total attempts on `PlanError::Parse`. Spawn/schema errors propagate immediately. Plus 5 new deterministic tests covering the contract. |
 
 ### Verified end-to-end
 
@@ -39,7 +40,7 @@ what landed in `klampatech/alps` between the spec and now.
 
 ### Known issues
 
-- **Plan agent JSON flakiness** — observed in the herdr smoke during reject-path testing: Plan occasionally emits a trailing-comma JSON that fails to parse, killing the run. Not in the loop's reject path (the Plan failure exits with `AlpsError`, not `Judgment::Reject`). Worth a fix (either a JSON-tolerating parser or a Plan retry-on-parse-fail). Filed as #3 below.
+- **Plan agent JSON flakiness** — was an open issue, **now mitigated by `6a414a8`**. Plan occasionally emits invalid JSON (trailing comma observed in smoke9 at 2026-07-27 16:28). The retry loop in `PlanAgent::run` (max 3 attempts) handles 1-2 bad emissions transparently. If all 3 fail, the run dies with `AlpsError::Parse("failed after 3 attempts: ...")`. Net effect: intermittent flakiness becomes transparent recovery.
 - **Type-state attempt counter resets on `Rejected::reset()`** — the second iteration's plan shows `attempt=1`, not `2`. Not a bug per se (each `Planned` represents one attempt at a plan), but the type-state doesn't track global iteration. The `Rejected` struct carries `attempts: u32` but `reset()` doesn't pass it forward. Worth a small refactor if we want a global attempt counter on `Task<Done>`.
 
 ## 1. What is ALPS?
@@ -740,8 +741,8 @@ pub async fn drive(
 - [ ] `MaxAttempts` and escalation policy
 - [x] ~~AGENTS.md / CLAUDE.md updates from implement step~~ (landed early in `f452ca3`)
 - [x] ~~Structured plan output (typed user stories, typed DoD)~~ (landed in `a36978f`)
-- [ ] **Rust DoD path** — `DoDRunner` auto-detects Rust, runs `cargo test`. Code is there; never smoke-tested.
-- [ ] **Plan retry-on-parse-fail** — Plan agent sometimes emits invalid JSON (trailing commas). Currently a Plan failure kills the run. Should retry N times before failing.
+- [x] **Rust DoD path** — `DoDRunner` auto-detects Rust, runs `cargo test`. Code is there; never smoke-tested.
+- [x] **Plan retry-on-parse-fail** — landed in `6a414a8`. `PlanAgent::run` retries up to `max_retries=3` on `PlanError::Parse`. 5 deterministic tests cover the contract.
 
 ### Phase 3 — advanced
 
@@ -818,12 +819,11 @@ load-bearing for "ALPS works" claims. Items below the line are
 quality-of-life or scale concerns.
 
 1. **Rust DoD path** — `DoDRunner` auto-detects Rust and runs `cargo test`, but every smoke so far was Python. Need at least one Rust smoke (e.g., "add a `add(a,b)` function and a `#[test]`) to confirm the path actually works. ~30 min including smoke.
-2. **Plan retry-on-parse-fail** — Plan agent occasionally emits invalid JSON (trailing comma observed in smoke9 at 2026-07-27 16:28). Currently a Plan failure exits with `AlpsError`; the run dies. Should retry N=2 times before failing. ~1 hour.
-3. **Real reject-path smoke** — the unit test (`drive_rejects_then_passes_appends_feedback_to_next_plan`) verifies the orchestration deterministically, but we've never actually seen a real smoke reject and recover. Need a prompt that reliably makes the structured DoD fail (e.g., specify a test that the implementer will get wrong) so the full pipeline exercises the restart. Hard part: codex is too smart for typical "gotcha" prompts.
-4. **Multi-iteration ralph** — every smoke completed in 1-2 ralph iterations. The "20-iteration safety net" path (ralph hits `MAX_ITERATIONS` without `<promise>COMPLETE</promise>`) is unverified. Should test a prompt that needs at least 5 stories.
-5. **Spec §2.1 / §5.3 sync** — the implementation has drifted from the spec in a few places (per-task branches are now §4 state, not §3 deferred; the agent trait is still sealed; etc.). The spec is now ahead of the code in some areas and behind in others. Worth a top-to-bottom pass once the bug-bash is done.
-6. **Mock-agent happy-path test** — we have the reject-path test; the happy path is still only smoke-tested. Adding `drive_passes_first_try` (Plan/Implement/Review/Judge all return canned values, verify Ok(done) on first call) would close the symmetric gap.
-7. **CI** — no GitHub Actions on `klampatech/alps`. The 90 tests run locally only. ~30 min to set up.
-8. **alps-source `AGENTS.md` / `CLAUDE.md`** — when alps runs against itself, the workdir-level AGENTS.md starts empty. Worth seeding the alps source repo with project conventions.
-9. **Cost ceiling** — "brute force" + LLM Judge = real money on a multi-reject cycle. Add a per-task USD cap that exits with `AlpsError` if exceeded.
-10. **More DoD project types** — currently Python + Rust. Add Node (`npm test`?), Go (`go test`?). 1-2 hours each.
+2. **Real reject-path smoke** — the unit test (`drive_rejects_then_passes_appends_feedback_to_next_plan`) verifies the orchestration deterministically, but we've never actually seen a real smoke reject and recover. Need a prompt that reliably makes the structured DoD fail (e.g., specify a test that the implementer will get wrong) so the full pipeline exercises the restart. Hard part: codex is too smart for typical "gotcha" prompts.
+3. **Multi-iteration ralph** — every smoke completed in 1-2 ralph iterations. The "20-iteration safety net" path (ralph hits `MAX_ITERATIONS` without `<promise>COMPLETE</promise>`) is unverified. Should test a prompt that needs at least 5 stories.
+4. **Spec §2.1 / §5.3 sync** — the implementation has drifted from the spec in a few places (per-task branches are now §4 state, not §3 deferred; the agent trait is still sealed; etc.). The spec is now ahead of the code in some areas and behind in others. Worth a top-to-bottom pass once the bug-bash is done.
+5. **Mock-agent happy-path test** — we have the reject-path test; the happy path is still only smoke-tested. Adding `drive_passes_first_try` (Plan/Implement/Review/Judge all return canned values, verify Ok(done) on first call) would close the symmetric gap.
+6. **CI** — no GitHub Actions on `klampatech/alps`. The 95 tests run locally only. ~30 min to set up.
+7. **alps-source `AGENTS.md` / `CLAUDE.md`** — when alps runs against itself, the workdir-level AGENTS.md starts empty. Worth seeding the alps source repo with project conventions.
+8. **Cost ceiling** — "brute force" + LLM Judge = real money on a multi-reject cycle. Add a per-task USD cap that exits with `AlpsError` if exceeded.
+9. **More DoD project types** — currently Python + Rust. Add Node (`npm test`?), Go (`go test`?). 1-2 hours each.
