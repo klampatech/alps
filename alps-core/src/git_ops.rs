@@ -10,6 +10,41 @@ use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
 
+/// Pattern that excludes the ralph nested git repo from `git add -A`.
+/// Written to `<workdir>/.git/info/exclude` (git's per-repo, never-tracked
+/// local exclude file) by `commit_smart` before staging.
+const RALPH_EXCLUDE_PATTERN: &str = "tasks/*/implementation/ralph/";
+
+/// Ensure `<workdir>/.git/info/exclude` contains the ralph exclusion. Idempotent:
+/// the line is only appended if it isn't already present. This is the
+/// `.git/info/exclude` mechanism (not `.gitignore` or a pathspec) because
+/// it's the only layer honored by the directory walker before the
+/// embedded-repo error fires — see the comment in `commit_smart` for details.
+fn ensure_ralph_excluded(dir: &Path) -> Result<(), GitOpsError> {
+    let exclude_path = dir.join(".git").join("info").join("exclude");
+    if let Some(parent) = exclude_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
+    if existing
+        .lines()
+        .any(|l| l.trim() == RALPH_EXCLUDE_PATTERN)
+    {
+        return Ok(());
+    }
+    // Ensure the file ends with a newline before appending.
+    let mut content = existing;
+    if !content.is_empty() && !content.ends_with('\n') {
+        content.push('\n');
+    }
+    content.push_str(&format!(
+        "# alps: exclude ralph's nested git repo (added by commit_smart)\n{}\n",
+        RALPH_EXCLUDE_PATTERN
+    ));
+    std::fs::write(&exclude_path, content)?;
+    Ok(())
+}
+
 #[derive(Debug, Error)]
 pub enum GitOpsError {
     #[error("git {op} failed: {msg}")]
@@ -50,6 +85,27 @@ pub fn commit_smart(dir: &Path, message: &str) -> Result<CommitOutcome, GitOpsEr
     }
 
     // 2. There are changes — stage and commit.
+    //
+    // Ensure the ralph nested git repo is excluded via `.git/info/exclude`
+    // (git's per-repo, never-tracked local exclude file). ralph.sh runs
+    // `git init` inside `tasks/<id>/implementation/ralph/` as its own working
+    // repo; without the exclusion, `git add -A` fails on git 2.42+ with
+    // "does not have a commit checked out" (the embedded-repo error). The
+    // alps source repo's own .gitignore already excludes
+    // `/tasks/**/implementation/`, but alps runs in a USER workdir whose
+    // .gitignore we don't control, so the fix must live here.
+    //
+    // Why `.git/info/exclude` and not a pathspec: git's `:`-exclude pathspec
+    // is applied AFTER recursion, so `git add -A -- ':!tasks/*/…'` still
+    // walks into the ralph dir and errors before the exclusion fires. The
+    // local exclude file is honored by the directory walker, which is the
+    // exact layer where the error originates.
+    //
+    // The exclude is idempotent: we only append the line if it isn't
+    // already present, so re-runs don't accumulate duplicates.
+    if let Err(e) = ensure_ralph_excluded(dir) {
+        eprintln!("warning: failed to update .git/info/exclude: {} (commit may fail with embedded-repo error)", e);
+    }
     let add = Command::new("git")
         .args(["add", "-A"])
         .current_dir(dir)
@@ -201,6 +257,75 @@ mod tests {
             "expected commit message in log, got: {}",
             text
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn commit_smart_excludes_nested_ralph_repo() {
+        // Regression: when ralph.sh runs in tasks/<id>/implementation/ralph/,
+        // it `git init`s that subdirectory as its own repo. `git add -A` from
+        // the workdir root picks up the nested .git/ and emits the
+        // "warning: adding embedded git repository" advisory — see
+        // smoke7 (w9V:p1) 2026-07-27 14:25 smoke run, and earlier f452ca3
+        // session. The fix: exclude the ralph subdirectory via pathspec so
+        // it never lands in the outer index.
+        let dir = unique_dir("nested-ralph");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "alps@test"]);
+        git(&dir, &["config", "user.name", "ALPS"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+
+        // Initial commit so we can stage new files.
+        fs::write(dir.join("README.md"), "# test\n").unwrap();
+        git(&dir, &["add", "README.md"]);
+        git(&dir, &["commit", "-m", "initial"]);
+
+        // Create the alps task structure: tasks/<id>/ with a real plan.json.
+        let task_id = "2026-07-27T000000-test";
+        let task_dir = dir.join("tasks").join(task_id);
+        fs::create_dir_all(&task_dir).unwrap();
+        fs::write(task_dir.join("plan.json"), "{}").unwrap();
+
+        // Simulate ralph.sh: `git init` inside implementation/ralph/ + write
+        // a real file. The nested .git/ is what triggers the warning.
+        let ralph_dir = task_dir.join("implementation").join("ralph");
+        fs::create_dir_all(&ralph_dir).unwrap();
+        let ralph_init = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&ralph_dir)
+            .output()
+            .unwrap();
+        assert!(ralph_init.status.success(), "ralph git init should succeed");
+        fs::write(ralph_dir.join("prd.json"), "{}").unwrap();
+        fs::write(ralph_dir.join("progress.txt"), "# Ralph\n").unwrap();
+
+        // Run commit_smart.
+        let outcome = commit_smart(&dir, "auto: capture changes").unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed);
+
+        // Verify the ralph files are NOT in the outer index.
+        let ls_files = Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&ls_files.stdout);
+        assert!(
+            !files.contains("implementation/ralph/"),
+            "ralph dir must not be tracked by the outer repo, but index contains:\n{}",
+            files
+        );
+        assert!(
+            !files.contains("implementation/ralph/.git"),
+            "ralph nested .git must not be tracked"
+        );
+        // Sanity: the alps-side files ARE tracked.
+        assert!(
+            files.contains("plan.json"),
+            "plan.json should be tracked, but index contains:\n{}",
+            files
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 
