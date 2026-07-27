@@ -37,6 +37,11 @@ pub enum JudgeError {
     #[error("llm check failed: {0}")]
     Llm(String),
 
+    /// LLM emitted invalid JSON. Retried up to `max_retries` in
+    /// `HermesLlmJudge` — only this variant triggers a retry.
+    #[error("failed to parse llm output: {0}")]
+    Parse(String),
+
     #[error("serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
 }
@@ -132,6 +137,17 @@ pub struct LlmJudgeConfig {
     pub max_file_bytes: usize,
     /// Skip remaining files once we exceed this total.
     pub max_total_bytes: usize,
+    /// Maximum number of total attempts when the LLM emits invalid JSON.
+    /// `1` = no retry (just the original attempt), `3` = 1 original + 2
+    /// retries (default). Only `JudgeError::Parse` triggers a retry; spawn
+    /// errors, schema validation errors, and unknown-verdict errors
+    /// propagate immediately.
+    #[serde(default = "default_llm_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_llm_max_retries() -> u32 {
+    3
 }
 
 impl Default for LlmJudgeConfig {
@@ -141,6 +157,7 @@ impl Default for LlmJudgeConfig {
             model: "claude-sonnet-4".to_string(),
             max_file_bytes: 50_000,
             max_total_bytes: 500_000,
+            max_retries: default_llm_max_retries(),
         }
     }
 }
@@ -150,11 +167,25 @@ impl Default for LlmJudgeConfig {
 /// feedback if not.
 pub struct HermesLlmJudge {
     pub config: LlmJudgeConfig,
+    /// Test-only override: when set, `judge()` calls this closure instead
+    /// of spawning Claude Code. The closure is called PER ATTEMPT (i.e.,
+    /// once per retry). Use `Arc<AtomicUsize>` inside the closure if you
+    /// need to return different responses across attempts.
+    #[cfg(test)]
+    pub(crate) test_handler: Option<
+        std::sync::Arc<
+            dyn Fn(&JudgeContext) -> Result<Judgment, JudgeError> + Send + Sync,
+        >,
+    >,
 }
 
 impl HermesLlmJudge {
     pub fn new(config: LlmJudgeConfig) -> Self {
-        HermesLlmJudge { config }
+        HermesLlmJudge {
+            config,
+            #[cfg(test)]
+            test_handler: None,
+        }
     }
 
     pub fn with_model(model: impl Into<String>) -> Self {
@@ -163,6 +194,23 @@ impl HermesLlmJudge {
                 model: model.into(),
                 ..Default::default()
             },
+            #[cfg(test)]
+            test_handler: None,
+        }
+    }
+
+    /// Test-only constructor that bypasses Claude Code. The closure
+    /// receives the judge context and returns a canned (or computed)
+    /// `Judgment`. Called PER ATTEMPT — use `Arc<AtomicUsize>` to return
+    /// different responses across attempts.
+    #[cfg(test)]
+    pub fn for_test<F>(f: F) -> Self
+    where
+        F: Fn(&JudgeContext) -> Result<Judgment, JudgeError> + Send + Sync + 'static,
+    {
+        HermesLlmJudge {
+            config: LlmJudgeConfig::default(),
+            test_handler: Some(std::sync::Arc::new(f)),
         }
     }
 }
@@ -176,6 +224,61 @@ impl Default for HermesLlmJudge {
 #[async_trait]
 impl LlmJudge for HermesLlmJudge {
     async fn judge(&self, ctx: &JudgeContext) -> Result<Judgment, JudgeError> {
+        // Retry loop. Claude Code occasionally emits invalid JSON (parse
+        // error). On `JudgeError::Parse`, retry up to `config.max_retries`
+        // total attempts. Spawn errors, schema validation errors, and
+        // unknown-verdict errors propagate immediately — retrying won't fix
+        // those (they're either deterministic for the same input, or the
+        // JSON parsed fine and the issue is semantic).
+        //
+        // See `judge_retries_on_parse_failure` in this file for the exact
+        // contract: per-attempt calls of the test_handler with monotonic
+        // attempt numbering, only `Parse` errors retried.
+        let max_attempts = self.config.max_retries.max(1) as usize;
+        let mut last_err: Option<JudgeError> = None;
+        for attempt in 1..=max_attempts {
+            match self.judge_once(ctx).await {
+                Ok(j) => return Ok(j),
+                Err(JudgeError::Parse(msg)) => {
+                    eprintln!(
+                        "[judge] parse failed (attempt {}/{}): {}",
+                        attempt, max_attempts, msg
+                    );
+                    last_err = Some(JudgeError::Parse(msg));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Err(JudgeError::Parse(format!(
+            "failed after {} attempts: {}",
+            max_attempts,
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Inherent methods (not on the LlmJudge trait)
+//
+// `judge_once` is called by the trait's `judge()` method (above) per
+// retry. It MUST live in an `impl HermesLlmJudge` block, not in the
+// `impl LlmJudge for HermesLlmJudge` block, because Rust resolves
+// `self.judge_once(...)` to the trait first — and the `LlmJudge` trait
+// doesn't have a `judge_once` method. Putting it here makes it an
+// inherent method on `HermesLlmJudge`, which is what we want.
+
+impl HermesLlmJudge {
+    /// One attempt of the LLM judge. Called by `judge()` per retry.
+    /// Either invokes the test_handler (cfg(test) only) or spawns Claude.
+    async fn judge_once(&self, ctx: &JudgeContext) -> Result<Judgment, JudgeError> {
+        // Test-only fast path: if a test_handler is set, use it instead of
+        // spawning Claude. The closure is called PER ATTEMPT (i.e., once
+        // per retry).
+        #[cfg(test)]
+        if let Some(f) = &self.test_handler {
+            return f(ctx);
+        }
+
         // 1. Read files from ralph_dir for verification context
         let files = read_files(&ctx.implementation, &self.config)?;
 
@@ -223,9 +326,17 @@ impl LlmJudge for HermesLlmJudge {
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let json_str = strip_markdown_fences(&stdout);
 
-        let parsed: ParsedVerdict = serde_json::from_str(json_str)
-            .map_err(|e| JudgeError::Llm(format!("parse: {}: {}", e, json_str.chars().take(500).collect::<String>())))?;
+        // JSON parse errors → JudgeError::Parse (triggers retry)
+        let parsed: ParsedVerdict = serde_json::from_str(json_str).map_err(|e| {
+            JudgeError::Parse(format!(
+                "{}: {}",
+                e,
+                json_str.chars().take(500).collect::<String>()
+            ))
+        })?;
 
+        // Schema/semantic errors → JudgeError::Llm (no retry — JSON parsed
+        // fine, the issue is in the contents).
         validate_verdict(&parsed)?;
 
         // 4. Build the Judgment
@@ -819,6 +930,8 @@ mod tests {
     use super::*;
     use crate::domain::{DefinitionOfDone, Finding, PlanId, StoryId, UserStory};
     use crate::domain::{Artifact, ArtifactKind, Commit};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use uuid::Uuid;
 
     fn dummy_ctx() -> JudgeContext {
@@ -1204,6 +1317,149 @@ mod tests {
             artifacts: vec![],
             metrics: Default::default(),
         }
+    }
+
+    /// Helper: a minimal valid `Judgment::Pass` for test fixtures. Built
+    /// fresh each call (closures can't return the same `Receipts` across
+    /// calls because `Receipts` contains the consumed `Review`).
+    fn pass_judgment(ctx: &JudgeContext) -> Judgment {
+        // Receipts requires a real Review context. We reuse the test
+        // fixture's review/plan. This is the success path; we just need
+        // a Pass judgment with reasonable fields.
+        Judgment::Pass(crate::receipt::Receipts {
+            task_id: ctx.task_id.clone(),
+            plan_id: ctx.plan.id.clone(),
+            plan_summary: ctx.plan.goal.clone(),
+            implement_metrics: Default::default(),
+            review_summary: crate::receipt::ReviewSummary::from_findings(
+                &ctx.review.findings,
+                &ctx.review.assertions,
+            ),
+            judged_at: chrono::Utc::now(),
+            judge_model: "test".to_string(),
+        })
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Retry-on-parse-failure tests (mirror plan.rs / review.rs)
+    // ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn judge_retries_on_parse_failure() {
+        // First 2 calls return Parse errors; 3rd call returns Ok(pass).
+        // With default max_retries=3, the loop should retry and succeed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let judge = HermesLlmJudge::for_test(move |ctx: &JudgeContext| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(JudgeError::Parse(format!(
+                    "simulated bad JSON on attempt {}",
+                    n + 1
+                )))
+            } else {
+                Ok(pass_judgment(ctx))
+            }
+        });
+
+        let result = judge.judge(&dummy_ctx()).await;
+
+        let j = result.expect("judge should succeed on 3rd attempt");
+        assert!(matches!(j, Judgment::Pass(_)));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn judge_gives_up_after_max_retries() {
+        // All 3 calls return Parse errors. After max_retries attempts,
+        // judge() should return a final Parse error wrapping the last failure.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let judge = HermesLlmJudge::for_test(move |_ctx: &JudgeContext| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(JudgeError::Parse(format!(
+                "simulated bad JSON on attempt {}",
+                n + 1
+            )))
+        });
+
+        let result = judge.judge(&dummy_ctx()).await;
+
+        let err = result.expect_err("judge should fail after max_retries");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed after 3 attempts"),
+            "expected 'failed after 3 attempts' in error, got: {}",
+            msg
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn judge_no_retry_on_first_success() {
+        // The closure returns Ok on the first call. No retries.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let judge = HermesLlmJudge::for_test(move |ctx: &JudgeContext| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(pass_judgment(ctx))
+        });
+
+        let result = judge.judge(&dummy_ctx()).await;
+        let _j = result.expect("judge should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retries on first success");
+    }
+
+    #[tokio::test]
+    async fn judge_does_not_retry_on_llm_error() {
+        // Non-Parse errors (e.g. spawn failure, unknown verdict) propagate
+        // immediately, no retry. Retrying a deterministic error won't help.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let judge = HermesLlmJudge::for_test(move |_ctx: &JudgeContext| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(JudgeError::Llm("spawn failed".to_string()))
+        });
+
+        let result = judge.judge(&dummy_ctx()).await;
+
+        let err = result.expect_err("llm error should fail without retry");
+        assert!(
+            err.to_string().contains("spawn failed"),
+            "expected 'spawn failed' in error, got: {}",
+            err
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry on Llm error"
+        );
+    }
+
+    #[tokio::test]
+    async fn judge_max_retries_1_means_no_retry() {
+        // max_retries=1: only the original attempt. Parse error → fail.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let judge = HermesLlmJudge {
+            config: LlmJudgeConfig {
+                max_retries: 1,
+                ..LlmJudgeConfig::default()
+            },
+            test_handler: Some(Arc::new(move |_ctx: &JudgeContext| {
+                calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Err(JudgeError::Parse("only attempt fails".to_string()))
+            })),
+        };
+
+        let result = judge.judge(&dummy_ctx()).await;
+        let err = result.expect_err("max_retries=1 should fail on first Parse error");
+        assert!(
+            err.to_string().contains("failed after 1 attempts"),
+            "expected 'failed after 1 attempts' in error, got: {}",
+            err
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry with max_retries=1");
     }
 }
 

@@ -54,6 +54,16 @@ pub struct ReviewConfig {
     pub max_file_bytes: usize,
     /// Skip remaining files once we exceed this total.
     pub max_total_bytes: usize,
+    /// Maximum number of total attempts when the LLM emits invalid JSON.
+    /// `1` = no retry (just the original attempt), `3` = 1 original + 2
+    /// retries (default). Only `ReviewError::Parse` triggers a retry; spawn
+    /// errors and schema validation errors are propagated immediately.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_max_retries() -> u32 {
+    3
 }
 
 impl Default for ReviewConfig {
@@ -63,6 +73,7 @@ impl Default for ReviewConfig {
             model: "claude-sonnet-4".to_string(),
             max_file_bytes: 50_000,
             max_total_bytes: 500_000,
+            max_retries: default_max_retries(),
         }
     }
 }
@@ -121,9 +132,59 @@ impl Agent for ReviewAgent {
     }
 
     async fn run(&self, ctx: ReviewContext) -> Result<Self::Output, Self::Error> {
+        // Retry loop. Claude Code occasionally emits invalid JSON (e.g.,
+        // trailing comma from a "finding description" field — observed
+        // 2026-07-27 in herdr smoke wA3:p1, parse error at line 16 col 42).
+        // On `ReviewError::Parse`, retry up to `config.max_retries` total
+        // attempts. Spawn errors and schema validation errors propagate
+        // immediately — retrying won't fix those (they're deterministic
+        // for the same input).
+        //
+        // See the `review_retries_on_parse_failure` test in this file for
+        // the exact contract: per-attempt calls of the test_handler with
+        // monotonic attempt numbering, only Parse errors retried.
+        let max_attempts = self.config.max_retries.max(1) as usize;
+        let mut last_err: Option<ReviewError> = None;
+        for attempt in 1..=max_attempts {
+            match self.run_once(ctx.clone()).await {
+                Ok(review) => return Ok(review),
+                Err(ReviewError::Parse(msg)) => {
+                    eprintln!(
+                        "[review] parse failed (attempt {}/{}): {}",
+                        attempt, max_attempts, msg
+                    );
+                    last_err = Some(ReviewError::Parse(msg));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Err(ReviewError::Parse(format!(
+            "failed after {} attempts: {}",
+            max_attempts,
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// Inherent methods (not on the Agent trait)
+//
+// `run_once` is called by the trait's `run()` method (above) per retry.
+// It MUST live in an `impl ReviewAgent` block, not in the
+// `impl Agent for ReviewAgent` block, because Rust resolves
+// `self.run_once(...)` to the trait first — and the `Agent` trait doesn't
+// have a `run_once` method. Putting it here makes it an inherent method
+// on `ReviewAgent`, which is what we want.
+
+impl ReviewAgent {
+    /// One attempt of the Review agent. Called by `run()` per retry.
+    /// Either invokes the test_handler (cfg(test) only) or spawns Claude.
+    async fn run_once(&self, ctx: ReviewContext) -> Result<Review, ReviewError> {
         // Test-only fast path: if a test_handler is set, use it instead of
-        // spawning Claude Code. This lets integration tests in `loop_::tests`
-        // exercise the orchestration deterministically.
+        // spawning Claude. The closure is called PER ATTEMPT (i.e., once
+        // per retry), so test fixtures can use interior mutability
+        // (Arc<AtomicUsize>, Arc<Mutex<Vec<_>>>) to return different
+        // responses across attempts.
         #[cfg(test)]
         if let Some(f) = &self.test_handler {
             return f(ctx);
@@ -486,7 +547,23 @@ mod tests {
     use super::*;
     use crate::domain::{Artifact, Commit, DefinitionOfDone, PlanId, StoryId, UserStory};
     use crate::domain::{Implementation, Plan};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use uuid::Uuid;
+
+    /// Helper: a minimal valid `Review` for test fixtures. Constructed fresh
+    /// each call (closures can't return the same `Review` across calls
+    /// because `Review` is consumed by `Result<Review, _>`).
+    fn test_review() -> Review {
+        Review {
+            findings: vec![],
+            assertions: vec![Assertion {
+                criterion: "tests pass".to_string(),
+                passed: true,
+                evidence: "1 passed".to_string(),
+            }],
+        }
+    }
 
     fn dummy_ctx() -> ReviewContext {
         ReviewContext {
@@ -668,5 +745,155 @@ mod tests {
     fn review_agent_name() {
         let agent = ReviewAgent::default();
         assert_eq!(agent.name(), "review");
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Retry-on-parse-failure tests (mirror plan.rs)
+    // ─────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn review_retries_on_parse_failure() {
+        // First 2 calls return Parse errors; 3rd call returns Ok(review).
+        // With default max_retries=3, the loop should retry and succeed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent::for_test(move |_ctx: ReviewContext| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(ReviewError::Parse(format!(
+                    "simulated bad JSON on attempt {}",
+                    n + 1
+                )))
+            } else {
+                Ok(test_review())
+            }
+        });
+
+        let result = agent.run(dummy_ctx()).await;
+
+        let review = result.expect("review should succeed on 3rd attempt");
+        assert_eq!(review.assertions.len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn review_gives_up_after_max_retries() {
+        // All 3 calls return Parse errors. After max_retries attempts,
+        // run() should return a final Parse error wrapping the last failure.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent::for_test(move |_ctx: ReviewContext| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(ReviewError::Parse(format!(
+                "simulated bad JSON on attempt {}",
+                n + 1
+            )))
+        });
+
+        let result = agent.run(dummy_ctx()).await;
+
+        let err = result.expect_err("review should fail after max_retries");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed after 3 attempts"),
+            "expected 'failed after 3 attempts' in error, got: {}",
+            msg
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn review_no_retry_on_first_success() {
+        // The closure returns Ok on the first call. No retries.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent::for_test(move |_ctx: ReviewContext| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(test_review())
+        });
+
+        let result = agent.run(dummy_ctx()).await;
+
+        let _review = result.expect("review should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retries on first success");
+    }
+
+    #[tokio::test]
+    async fn review_does_not_retry_on_claude_code_error() {
+        // Non-Parse errors (e.g. ClaudeCode) propagate immediately, no retry.
+        // Retrying a spawn error won't help (deterministic for the same input).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent::for_test(move |_ctx: ReviewContext| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(ReviewError::ClaudeCode("spawn failed".to_string()))
+        });
+
+        let result = agent.run(dummy_ctx()).await;
+
+        let err = result.expect_err("claude code error should fail without retry");
+        assert!(
+            err.to_string().contains("spawn failed"),
+            "expected 'spawn failed' in error, got: {}",
+            err
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry on ClaudeCode error"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_does_not_retry_on_schema_error() {
+        // Schema errors (e.g. empty criterion) are deterministic — the LLM
+        // produced valid JSON but with wrong structure. Retrying won't help
+        // (the schema is invariant to retry).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent::for_test(move |_ctx: ReviewContext| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(ReviewError::Schema("no assertions".to_string()))
+        });
+
+        let result = agent.run(dummy_ctx()).await;
+
+        let err = result.expect_err("schema error should fail without retry");
+        assert!(
+            err.to_string().contains("no assertions"),
+            "expected 'no assertions' in error, got: {}",
+            err
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry on Schema error"
+        );
+    }
+
+    #[tokio::test]
+    async fn review_max_retries_1_means_no_retry() {
+        // max_retries=1: only the original attempt. Parse error → fail.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let agent = ReviewAgent {
+            config: ReviewConfig {
+                max_retries: 1,
+                ..ReviewConfig::default()
+            },
+            test_handler: Some(Arc::new(move |_ctx: ReviewContext| {
+                calls_for_closure.fetch_add(1, Ordering::SeqCst);
+                Err(ReviewError::Parse("only attempt fails".to_string()))
+            })),
+        };
+
+        let result = agent.run(dummy_ctx()).await;
+        let err = result.expect_err("max_retries=1 should fail on first Parse error");
+        assert!(
+            err.to_string().contains("failed after 1 attempts"),
+            "expected 'failed after 1 attempts' in error, got: {}",
+            err
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry with max_retries=1");
     }
 }
