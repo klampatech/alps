@@ -5,3 +5,4 @@ Cargo.lock.bak
 # Stale ralph artifacts created when scripts/ralph.sh is invoked outside a task workspace
 /scripts/progress.txt
 /scripts/prd.json
+/scripts/.codex-last-message.txt
