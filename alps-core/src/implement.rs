@@ -20,6 +20,7 @@ use tokio::process::Command;
 
 use crate::agent::{Agent, sealed};
 use crate::domain::{Artifact, ArtifactKind, Commit, Implementation, Plan};
+use crate::receipt::ImplementMetrics;
 
 #[derive(Debug, Error)]
 pub enum ImplementError {
@@ -284,23 +285,27 @@ venv/
         let stories_passed = prd_after.user_stories.iter().filter(|s| s.passes).count() as u32;
         let stories_total = prd_after.user_stories.len() as u32;
 
-        eprintln!(
-            "[implement] done: {}/{} stories passed, {} commits, {} artifacts",
-            stories_passed, stories_total, commits.len(), artifacts.len()
-        );
+        // Read ralph.sh's own metrics (iterations, elapsed_secs) so receipts
+        // show real numbers, not zeros.
+        let ralph_result = read_ralph_result(&ralph_dir)?;
 
-        // Implement metrics live in the Implementation struct's prd_path, but we
-        // also need to surface stories/iterations to the receipts. Receipts come
-        // from the Judge, which can read these from the Implementation or the
-        // persisted prd.json. For now, we expose stories via the artifacts list
-        // (prd.json is included).
-        let _ = (stories_passed, stories_total); // used for logging only
+        eprintln!(
+            "[implement] done: {}/{} stories passed, {} commits, {} artifacts, {} iterations, {}s elapsed",
+            stories_passed, stories_total, commits.len(), artifacts.len(),
+            ralph_result.iterations, ralph_result.elapsed_secs
+        );
 
         Ok(Implementation {
             ralph_branch: prd_after.branch_name,
             prd_path: ralph_dir.join("prd.json"),
             commits,
             artifacts,
+            metrics: ImplementMetrics {
+                stories_passed,
+                stories_total,
+                iterations: ralph_result.iterations,
+                elapsed_secs: ralph_result.elapsed_secs,
+            },
         })
     }
 }
@@ -472,6 +477,8 @@ fn read_artifacts(ralph_dir: &Path) -> Result<Vec<Artifact>, ImplementError> {
         "prd.json",
         "progress.txt",
         ".codex-last-message.txt",
+        ".ralph-result.json",
+        ".last-branch",
         ".git",
     ];
 
@@ -528,6 +535,41 @@ fn with_op(op: &str) -> ImplementError {
 }
 
 // ─────────────────────────────────────────────────────────────
+// Ralph .ralph-result.json (written by ralph.sh on every run)
+// ─────────────────────────────────────────────────────────────
+
+/// What ralph.sh writes to `.ralph-result.json` so alps can report real
+/// iteration counts and elapsed time in receipts (instead of guessing).
+/// All fields default — ralph.sh may write only some of them (e.g. if it
+/// crashed mid-run, elapsed_secs may be missing).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RalphResult {
+    #[serde(default)]
+    pub iterations: u32,
+    #[serde(default)]
+    pub elapsed_secs: u64,
+    #[serde(default)]
+    pub completed: bool,
+}
+
+/// Read `.ralph-result.json` from the ralph workspace. If the file is
+/// missing (older ralph.sh, crash before write), return `Default::default()`
+/// — the receipts will honestly show 0 rather than fabricate numbers.
+pub fn read_ralph_result(ralph_dir: &Path) -> Result<RalphResult, ImplementError> {
+    let path = ralph_dir.join(".ralph-result.json");
+    match std::fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str(&text).map_err(|e| {
+            ImplementError::PrdParse(format!(".ralph-result.json invalid: {}: {}", e, text))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RalphResult::default()),
+        Err(e) => Err(ImplementError::RalphSetup(format!(
+            "read .ralph-result.json: {}",
+            e
+        ))),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────
 
@@ -536,6 +578,19 @@ mod tests {
     use super::*;
     use crate::domain::{PlanId, StoryId, UserStory, DefinitionOfDone};
     use uuid::Uuid;
+
+    /// Tiny test helper — create a uniquely-named temp dir under `/tmp` without
+    /// pulling in the `tempfile` crate just for this. Returns the dir path.
+    fn tempdir_via_tmp(label: &str) -> PathBuf {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = PathBuf::from(format!("/tmp/alps-test-{}-{}{}", label, pid, nanos));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
 
     fn dummy_plan() -> Plan {
         Plan {
@@ -584,6 +639,48 @@ mod tests {
         assert!(json.contains("\"passes\":false"));
         assert!(json.contains("\"priority\":1"));
         assert!(json.contains("\"priority\":2"));
+    }
+
+    #[test]
+    fn ralph_result_parses_full_json() {
+        // Happy path: ralph.sh writes a complete .ralph-result.json on success.
+        let dir = tempdir_via_tmp("alps-ralph-result-ok");
+        std::fs::write(
+            dir.join(".ralph-result.json"),
+            r#"{"iterations": 3, "elapsed_secs": 184, "completed": true}"#,
+        )
+        .unwrap();
+        let r = read_ralph_result(&dir).unwrap();
+        assert_eq!(r.iterations, 3);
+        assert_eq!(r.elapsed_secs, 184);
+        assert!(r.completed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ralph_result_missing_file_returns_zeros() {
+        // Backward-compat: if ralph.sh didn't write the file (older version,
+        // crashed before writing, etc.), we should NOT error — we should return
+        // a default. The receipts will show 0, which is honest "we don't know".
+        let dir = tempdir_via_tmp("alps-ralph-result-missing");
+        let r = read_ralph_result(&dir).unwrap();
+        assert_eq!(r.iterations, 0);
+        assert_eq!(r.elapsed_secs, 0);
+        assert!(!r.completed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ralph_result_partial_json_uses_defaults() {
+        // ralph.sh might write only some fields. Missing fields default to
+        // 0/false rather than erroring.
+        let dir = tempdir_via_tmp("alps-ralph-result-partial");
+        std::fs::write(dir.join(".ralph-result.json"), r#"{"iterations": 5}"#).unwrap();
+        let r = read_ralph_result(&dir).unwrap();
+        assert_eq!(r.iterations, 5);
+        assert_eq!(r.elapsed_secs, 0);
+        assert!(!r.completed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

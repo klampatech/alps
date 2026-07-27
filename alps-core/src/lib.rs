@@ -8,6 +8,7 @@
 pub mod agent;
 pub mod domain;
 pub mod error;
+pub mod git_ops;
 pub mod implement;
 pub mod judge;
 pub mod loop_;

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::domain::{PlanId, Severity, TaskId};
 use chrono::{DateTime, Utc};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ImplementMetrics {
     pub stories_passed: u32,
     pub stories_total: u32,

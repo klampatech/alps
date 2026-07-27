@@ -433,17 +433,11 @@ fn validate_verdict(p: &ParsedVerdict) -> Result<(), JudgeError> {
 }
 
 fn build_receipts(ctx: &JudgeContext, judge_model: &str) -> Receipts {
-    let metrics = ImplementMetrics {
-        stories_passed: ctx
-            .plan
-            .stories
-            .iter()
-            .filter(|s| !s.title.is_empty())
-            .count() as u32,
-        stories_total: ctx.plan.stories.len() as u32,
-        iterations: 0, // unknown without more state
-        elapsed_secs: 0,
-    };
+    // The implementation already carried the real metrics through (Ralph
+    // run → .ralph-result.json → implement.rs → Implementation.metrics).
+    // Don't recompute from the plan — that loses Ralph's iteration count
+    // and elapsed time.
+    let metrics = ctx.implementation.metrics.clone();
     let summary = ReviewSummary::from_findings(&ctx.review.findings, &ctx.review.assertions);
 
     Receipts {
@@ -829,6 +823,7 @@ mod tests {
                     path: PathBuf::from("fib.py"),
                     kind: ArtifactKind::Source,
                 }],
+                metrics: Default::default(),
             },
             review: Review {
                 findings: vec![],
@@ -960,6 +955,30 @@ mod tests {
         assert_eq!(r.task_id, expected_id);
         assert_eq!(r.judge_model, "test-model");
         assert_eq!(r.plan_id, ctx.plan.id);
+    }
+
+    #[test]
+    fn build_receipts_uses_implementation_metrics_not_zeros() {
+        // Regression: build_receipts used to hardcode iterations=0, elapsed_secs=0.
+        // It must read from ctx.implementation.metrics so the receipts reflect
+        // the actual Ralph run.
+        let mut ctx = dummy_ctx();
+        ctx.implementation.metrics = ImplementMetrics {
+            stories_passed: 2,
+            stories_total: 3,
+            iterations: 7,
+            elapsed_secs: 1234,
+        };
+        let r = build_receipts(&ctx, "test-model");
+        assert_eq!(
+            r.implement_metrics,
+            ImplementMetrics {
+                stories_passed: 2,
+                stories_total: 3,
+                iterations: 7,
+                elapsed_secs: 1234,
+            }
+        );
     }
 
     #[test]
@@ -1129,6 +1148,7 @@ mod tests {
             prd_path: PathBuf::from("/tmp/prd.json"),
             commits: vec![],
             artifacts: vec![],
+            metrics: Default::default(),
         }
     }
 }

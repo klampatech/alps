@@ -460,6 +460,7 @@ mod tests {
                     path: PathBuf::from("fib.py"),
                     kind: ArtifactKind::Source,
                 }],
+                metrics: Default::default(),
             },
         }
     }

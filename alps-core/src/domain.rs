@@ -81,6 +81,9 @@ pub struct Implementation {
     pub prd_path: PathBuf,
     pub commits: Vec<Commit>,
     pub artifacts: Vec<Artifact>,
+    /// Metrics captured from the Ralph run — iterations, elapsed time, story
+    /// completion. Plumbed through to receipts so the user sees real numbers.
+    pub metrics: crate::receipt::ImplementMetrics,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

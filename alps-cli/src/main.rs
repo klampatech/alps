@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alps_core::domain::{Prompt, TaskId};
+use alps_core::git_ops::{commit_smart, CommitOutcome, GitOpsError};
 use alps_core::implement::ImplementAgent;
 use alps_core::judge::{DoDRunner, HermesLlmJudge, JudgeAgent};
 use alps_core::loop_::drive;
@@ -127,10 +128,23 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
             alps_core::persistence::persist_task(&done, &workspace)
                 .map_err(|e| anyhow::anyhow!("persistence failed: {}", e))?;
 
-            // Git commit the final state. Best-effort: if there's no .git
-            // (e.g. running from a fresh checkout) we just log and continue.
-            if let Err(e) = git_commit(&format!("done: {}", task_id.as_str())) {
-                eprintln!("warning: git commit skipped: {}", e);
+            // Auto-commit only if there are changes. Most ALPS runs produce
+            // work in tasks/<id>/ which is gitignored, so this is a no-op
+            // in practice. The smart check prevents a noisy warning.
+            match commit_smart(&workdir, &format!("done: {}", task_id.as_str())) {
+                Ok(CommitOutcome::NothingToCommit) => {} // silent — expected
+                Ok(CommitOutcome::Committed) => {
+                    eprintln!("[done] auto-committed final state");
+                }
+                Ok(CommitOutcome::CommitFailed(msg)) => {
+                    eprintln!("warning: git commit failed: {}", msg);
+                }
+                Err(GitOpsError::Git { op, msg }) => {
+                    eprintln!("warning: git {} error: {}", op, msg);
+                }
+                Err(e) => {
+                    eprintln!("warning: auto-commit skipped: {}", e);
+                }
             }
 
             // Print markdown summary to stdout
@@ -168,20 +182,4 @@ fn print_markdown(task: &Task<Done>) {
     println!("- **Judge model:** {}", r.judge_model);
     println!();
     println!("Receipts written to `tasks/{}/receipts.json`", task.id.as_str());
-}
-
-fn git_commit(message: &str) -> Result<()> {
-    let add = std::process::Command::new("git")
-        .args(&["add", "-A"])
-        .status()?;
-    if !add.success() {
-        anyhow::bail!("git add failed");
-    }
-    let commit = std::process::Command::new("git")
-        .args(&["commit", "-m", message])
-        .status()?;
-    if !commit.success() {
-        anyhow::bail!("git commit failed");
-    }
-    Ok(())
 }

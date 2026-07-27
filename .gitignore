@@ -6,3 +6,8 @@ Cargo.lock.bak
 /scripts/progress.txt
 /scripts/prd.json
 /scripts/.codex-last-message.txt
+/scripts/.ralph-result.json
+# Same at the alps root, if ralph.sh is ever run from there
+/progress.txt
+/.ralph-result.json
+/.codex-last-message.txt
