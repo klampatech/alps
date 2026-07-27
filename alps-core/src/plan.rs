@@ -31,6 +31,16 @@ pub struct PlanConfig {
     pub model: String,
     /// System prompt that instructs Claude to emit JSON.
     pub system_prompt: String,
+    /// Maximum number of total attempts when the LLM emits invalid JSON.
+    /// `1` = no retry (just the original attempt), `3` = 1 original + 2
+    /// retries (default). Only `PlanError::Parse` triggers a retry; spawn
+    /// errors and schema validation errors are propagated immediately.
+    #[serde(default = "default_max_retries")]
+    pub max_retries: u32,
+}
+
+fn default_max_retries() -> u32 {
+    3
 }
 
 impl Default for PlanConfig {
@@ -39,6 +49,7 @@ impl Default for PlanConfig {
             claude_path: "claude".to_string(),
             model: "claude-sonnet-4".to_string(),
             system_prompt: PLAN_AGENT_SYSTEM_PROMPT.to_string(),
+            max_retries: default_max_retries(),
         }
     }
 }
@@ -50,6 +61,11 @@ pub struct PlanAgent {
     /// Test-only override: when set, `run()` calls this closure instead of
     /// spawning Claude Code. Used by `drive_*` integration tests in
     /// `loop_::tests` to deterministically exercise the orchestration.
+    ///
+    /// `run()` calls this closure PER ATTEMPT (i.e., once per retry). Use
+    /// `Arc<AtomicUsize>` inside the closure if you need to return
+    /// different responses across attempts (e.g., fail N-1 times then
+    /// succeed on the Nth).
     #[cfg(test)]
     pub(crate) test_handler: Option<std::sync::Arc<dyn Fn(Prompt) -> Result<Plan, PlanError> + Send + Sync>>,
 }
@@ -88,28 +104,28 @@ impl PlanAgent {
     }
 }
 
-impl Default for PlanAgent {
-    fn default() -> Self {
-        PlanAgent::new("claude-sonnet-4")
-    }
-}
+// ─────────────────────────────────────────────────────────────
+// Inherent methods (not on the Agent trait)
+// ─────────────────────────────────────────────────────────────
+//
+// `run_once` is called by the trait's `run()` method (above) per retry.
+// It MUST live in an `impl PlanAgent` block, not in the `impl Agent for
+// PlanAgent` block, because Rust resolves `self.run_once(...)` to the
+// trait first — and the `Agent` trait doesn't have a `run_once` method.
+// Putting it here makes it an inherent method on `PlanAgent`, which is
+// what we want.
 
-impl sealed::Sealed for PlanAgent {}
-
-#[async_trait]
-impl Agent for PlanAgent {
-    type Input = Prompt;
-    type Output = Plan;
-    type Error = PlanError;
-
-    fn name(&self) -> &'static str {
-        "plan"
-    }
-
-    async fn run(&self, input: Prompt) -> Result<Self::Output, Self::Error> {
+impl PlanAgent {
+    /// One attempt of the Plan agent. Called by `run()` per retry.
+    /// Either invokes the test_handler (cfg(test) only) or spawns Claude Code.
+    async fn run_once(&self, input: Prompt) -> Result<Plan, PlanError> {
         // Test-only fast path: if a test_handler is set, use it instead of
         // spawning Claude Code. This lets integration tests in `loop_::tests`
-        // exercise the orchestration deterministically.
+        // and `plan_retries_on_parse_failure` exercise the orchestration
+        // deterministically. The closure is called PER ATTEMPT (i.e., once
+        // per retry), so test fixtures can use interior mutability
+        // (Arc<AtomicUsize>, Arc<Mutex<Vec<_>>>) to return different
+        // responses across attempts.
         #[cfg(test)]
         if let Some(f) = &self.test_handler {
             return f(input);
@@ -169,13 +185,64 @@ impl Agent for PlanAgent {
         let json_str = strip_markdown_fences(&stdout);
 
         let parsed: ParsedPlan = serde_json::from_str(json_str)
-            .map_err(|e| PlanError::Parse(format!("{}: {}", e, json_str.chars().take(500).collect::<String>())))
-            .map_err(|e| PlanError::Parse(e.to_string()))?;
+            .map_err(|e| PlanError::Parse(format!("{}: {}", e, json_str.chars().take(500).collect::<String>())))?;
 
         // Schema validation
         validate_plan(&parsed)?;
 
         Ok(parsed.into_plan())
+    }
+}
+
+impl Default for PlanAgent {
+    fn default() -> Self {
+        PlanAgent::new("claude-sonnet-4")
+    }
+}
+
+impl sealed::Sealed for PlanAgent {}
+
+#[async_trait]
+impl Agent for PlanAgent {
+    type Input = Prompt;
+    type Output = Plan;
+    type Error = PlanError;
+
+    fn name(&self) -> &'static str {
+        "plan"
+    }
+
+    async fn run(&self, input: Prompt) -> Result<Self::Output, Self::Error> {
+        // Retry loop. Claude Code occasionally emits invalid JSON (e.g.,
+        // trailing comma from a "story titles" field — observed 2026-07-27
+        // in herdr smokes). On `PlanError::Parse`, retry up to
+        // `config.max_retries` total attempts. Spawn errors and schema
+        // validation errors are propagated immediately — retrying won't fix
+        // those (they're deterministic for the same input).
+        //
+        // See the `plan_retries_on_parse_failure` test in this file for
+        // the exact contract: per-attempt calls of the test_handler with
+        // monotonic attempt numbering, only Parse errors retried.
+        let max_attempts = self.config.max_retries.max(1) as usize;
+        let mut last_err: Option<PlanError> = None;
+        for attempt in 1..=max_attempts {
+            match self.run_once(input.clone()).await {
+                Ok(plan) => return Ok(plan),
+                Err(PlanError::Parse(msg)) => {
+                    eprintln!(
+                        "[plan] parse failed (attempt {}/{}): {}",
+                        attempt, max_attempts, msg
+                    );
+                    last_err = Some(PlanError::Parse(msg));
+                }
+                Err(other) => return Err(other),
+            }
+        }
+        Err(PlanError::Parse(format!(
+            "failed after {} attempts: {}",
+            max_attempts,
+            last_err.map(|e| e.to_string()).unwrap_or_default()
+        )))
     }
 }
 
@@ -478,5 +545,168 @@ mod tests {
         assert_eq!(plan.stories[0].id, StoryId("US-001".to_string()));
         assert_eq!(plan.dod.len(), 1);
         assert!(plan.dod[0].verifiable);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Retry-on-parse-failure tests
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // Background: Claude Code (the Plan LLM) occasionally emits invalid JSON
+    // (trailing comma, etc.) — observed 2026-07-27 in herdr smokes. Before the
+    // retry, a single bad emission killed the run. The retry loop in
+    // `PlanAgent::run` retries up to `config.max_retries` total attempts when
+    // `run_once` returns `PlanError::Parse`. These tests verify the contract
+    // deterministically by using `for_test` + interior-mutability to return
+    // different responses across attempts.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Build a fresh Plan with a unique PlanId for testing.
+    fn test_plan() -> Plan {
+        Plan {
+            id: PlanId(Uuid::new_v4()),
+            goal: "test goal".to_string(),
+            architecture: "test".to_string(),
+            stories: vec![UserStory {
+                id: StoryId("US-001".to_string()),
+                title: "test".to_string(),
+                description: "test".to_string(),
+                acceptance_criteria: vec!["test".to_string()],
+                priority: 1,
+            }],
+            dod: vec![DefinitionOfDone {
+                criterion: "tests pass".to_string(),
+                verifiable: true,
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_retries_on_parse_failure() {
+        // First 2 calls return Parse errors; 3rd call returns Ok(plan).
+        // With default max_retries=3, the loop should retry and succeed.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            if n < 2 {
+                Err(PlanError::Parse(format!("simulated bad JSON on attempt {}", n + 1)))
+            } else {
+                Ok(test_plan())
+            }
+        });
+
+        let result = plan.run(Prompt::new("test")).await;
+
+        // The 3rd attempt should succeed.
+        let plan_out = result.expect("plan should succeed on 3rd attempt");
+        assert_eq!(plan_out.goal, "test goal");
+
+        // The closure was called exactly 3 times (2 Parse errors + 1 Ok).
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn plan_gives_up_after_max_retries() {
+        // All 3 calls return Parse errors. After max_retries attempts,
+        // run() should return a final Parse error wrapping the last failure.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| {
+            let n = calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(PlanError::Parse(format!("simulated bad JSON on attempt {}", n + 1)))
+        });
+
+        let result = plan.run(Prompt::new("test")).await;
+
+        // No plan returned.
+        let err = result.expect_err("plan should fail after max_retries");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed after 3 attempts"),
+            "expected 'failed after 3 attempts' in error, got: {}",
+            msg
+        );
+
+        // The closure was called exactly 3 times (max_retries).
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn plan_no_retry_on_first_success() {
+        // The closure returns Ok on the first call. No retries.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(test_plan())
+        });
+
+        let result = plan.run(Prompt::new("test")).await;
+
+        let _plan = result.expect("plan should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retries on first success");
+    }
+
+    #[tokio::test]
+    async fn plan_does_not_retry_on_spawn_error() {
+        // Non-Parse errors (e.g. ClaudeCode) propagate immediately, no retry.
+        // This is important: retrying a spawn error won't help (deterministic
+        // for the same input).
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| {
+            calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Err(PlanError::ClaudeCode("spawn failed".to_string()))
+        });
+
+        let result = plan.run(Prompt::new("test")).await;
+
+        let err = result.expect_err("spawn error should fail without retry");
+        assert!(
+            err.to_string().contains("spawn failed"),
+            "expected 'spawn failed' in error, got: {}",
+            err
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "no retry on ClaudeCode error"
+        );
+    }
+
+    #[tokio::test]
+    async fn plan_max_retries_1_means_no_retry() {
+        // max_retries=1: only the original attempt. Parse error → fail.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_closure = calls.clone();
+        let mut config = PlanConfig::default();
+        config.max_retries = 1;
+        let plan = PlanAgent::with_config(config);
+        // We need for_test but with custom config — use the public field.
+        // The test_handler field is pub(crate), but for tests in the same
+        // crate, we can set it via the constructor. We'll re-construct.
+        drop(plan);
+        let calls_for_closure_2 = calls.clone();
+        let plan = PlanAgent {
+            config: PlanConfig {
+                max_retries: 1,
+                ..PlanConfig::default()
+            },
+            test_handler: Some(Arc::new(move |_input: Prompt| {
+                calls_for_closure_2.fetch_add(1, Ordering::SeqCst);
+                Err(PlanError::Parse("only attempt fails".to_string()))
+            })),
+        };
+
+        let result = plan.run(Prompt::new("test")).await;
+        let err = result.expect_err("max_retries=1 should fail on first Parse error");
+        assert!(
+            err.to_string().contains("failed after 1 attempts"),
+            "expected 'failed after 1 attempts' in error, got: {}",
+            err
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry with max_retries=1");
     }
 }
