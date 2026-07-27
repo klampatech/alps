@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alps_core::domain::{Prompt, TaskId};
-use alps_core::git_ops::{commit_smart, CommitOutcome, GitOpsError};
+use alps_core::git_ops::{commit_smart, create_branch, CommitOutcome, GitOpsError};
 use alps_core::implement::ImplementAgent;
 use alps_core::judge::{DoDRunner, HermesLlmJudge, JudgeAgent};
 use alps_core::loop_::drive;
@@ -88,6 +88,22 @@ async fn run_task(prompt: String, workdir: String) -> Result<()> {
     let workspace = TaskWorkspace::new(&workspace_root);
 
     info!(target: "alps.cli", task_id = %task_id.as_str(), "starting task");
+
+    // Create per-task branch in the workdir so receipts + plan + feedback are
+    // tracked in git history. The user can review `alps/<task-id>` to see
+    // what alps did for that run, then merge to main or discard.
+    let branch = format!("alps/{}", task_id.as_str());
+    match create_branch(&workdir, &branch) {
+        Ok(()) => eprintln!("[alps] on branch: {}", branch),
+        Err(GitOpsError::Git { op, msg }) => {
+            eprintln!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
+            eprintln!("warning: continuing on current branch (no per-task isolation)");
+        }
+        Err(e) => {
+            eprintln!("warning: per-task branch failed: {}", e);
+            eprintln!("warning: continuing on current branch (no per-task isolation)");
+        }
+    }
 
     let task = Task::<alps_core::task::Idle>::new(
         task_id.clone(),

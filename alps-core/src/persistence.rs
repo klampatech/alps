@@ -60,6 +60,13 @@ impl TaskWorkspace {
         self.root.join("implementation").join("ralph")
     }
 
+    /// Path to the per-task AGENTS.md (lives at the task level, not inside
+    /// the ralph subdirectory, so it survives between ralph invocations and
+    /// is visible to all agents: plan, review, judge, plan-on-retry).
+    pub fn agents_md_path(&self) -> PathBuf {
+        self.root.join("AGENTS.md")
+    }
+
     pub fn exists(&self) -> bool {
         self.root.exists()
     }

@@ -73,6 +73,49 @@ pub fn commit_smart(dir: &Path, message: &str) -> Result<CommitOutcome, GitOpsEr
     Ok(CommitOutcome::Committed)
 }
 
+/// Create `branch_name` in `dir` and check it out. Idempotent: if the branch
+/// already exists (e.g. from a prior outer-loop attempt), just check it out
+/// without erroring.
+///
+/// Used to create per-task branches `alps/<task-id>` so each run has isolated
+/// commit history that the user can review and merge or discard.
+pub fn create_branch(dir: &Path, branch_name: &str) -> Result<(), GitOpsError> {
+    // Check if the branch already exists.
+    let exists = Command::new("git")
+        .args(["rev-parse", "--verify", "--quiet", &format!("refs/heads/{}", branch_name)])
+        .current_dir(dir)
+        .output()?
+        .status
+        .success();
+
+    if exists {
+        // Reuse — just check it out.
+        let checkout = Command::new("git")
+            .args(["checkout", branch_name])
+            .current_dir(dir)
+            .status()?;
+        if !checkout.success() {
+            return Err(GitOpsError::Git {
+                op: format!("checkout existing branch {}", branch_name),
+                msg: format!("exit {:?}", checkout.code()),
+            });
+        }
+    } else {
+        // Create and check out in one step.
+        let create = Command::new("git")
+            .args(["checkout", "-b", branch_name])
+            .current_dir(dir)
+            .status()?;
+        if !create.success() {
+            return Err(GitOpsError::Git {
+                op: format!("create branch {}", branch_name),
+                msg: format!("exit {:?}", create.code()),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +199,67 @@ mod tests {
         assert!(
             text.contains("auto: capture changes"),
             "expected commit message in log, got: {}",
+            text
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_branch_makes_new_branch_and_checks_it_out() {
+        // First run of a task: branch doesn't exist, create_branch creates it
+        // and switches to it.
+        let dir = unique_dir("new-branch");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "alps@test"]);
+        git(&dir, &["config", "user.name", "ALPS"]);
+        // Need an initial commit so we can create a branch off it.
+        fs::write(dir.join("README.md"), "init\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "init"]);
+
+        create_branch(&dir, "alps/test-task").unwrap();
+
+        // Verify we're on the new branch.
+        let out = Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_eq!(current, "alps/test-task", "expected on new branch, was: {}", current);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn create_branch_is_idempotent_on_retry() {
+        // Outer-loop retry: branch already exists from a prior attempt.
+        // create_branch must reuse it, NOT fail with "branch already exists".
+        let dir = unique_dir("existing-branch");
+        git(&dir, &["init", "-q"]);
+        git(&dir, &["config", "user.email", "alps@test"]);
+        git(&dir, &["config", "user.name", "ALPS"]);
+        fs::write(dir.join("README.md"), "init\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "init"]);
+        // Simulate a prior run: create the branch and add a commit on it.
+        git(&dir, &["checkout", "-b", "alps/retry-task"]);
+        fs::write(dir.join("prior.md"), "from previous attempt\n").unwrap();
+        git(&dir, &["add", "."]);
+        git(&dir, &["commit", "-m", "prior attempt"]);
+
+        // Now call create_branch on the existing branch.
+        create_branch(&dir, "alps/retry-task").unwrap();
+
+        // Verify the prior commit is still on the branch.
+        let log = Command::new("git")
+            .args(["log", "--oneline"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            text.contains("prior attempt"),
+            "prior commit should still be on the branch, got: {}",
             text
         );
         let _ = fs::remove_dir_all(&dir);

@@ -6,6 +6,7 @@
 //! See `SPEC.md` for the full design.
 
 pub mod agent;
+pub mod agents_md;
 pub mod domain;
 pub mod error;
 pub mod git_ops;

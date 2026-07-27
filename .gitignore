@@ -1,13 +1,18 @@
 /target
 **/*.rs.bk
 Cargo.lock.bak
-/tasks/
+# Per-task state files (plan.json, prompt.md, receipts.json, AGENTS.md) are
+# tracked on per-task branches `alps/<task-id>`, NOT on main. The ralph
+# nested git repo + ralph's working files stay out of the alps repo (they
+# have their own git history in implementation/ralph/.git).
+/tasks/**/implementation/
+# ralph.sh writes .last-branch in the workspace to detect branch changes.
+/.last-branch
 # Stale ralph artifacts created when scripts/ralph.sh is invoked outside a task workspace
 /scripts/progress.txt
 /scripts/prd.json
 /scripts/.codex-last-message.txt
 /scripts/.ralph-result.json
-# Same at the alps root, if ralph.sh is ever run from there
 /progress.txt
 /.ralph-result.json
 /.codex-last-message.txt

@@ -48,6 +48,9 @@ pub struct JudgeContext {
     pub plan: Plan,
     pub implementation: Implementation,
     pub review: Review,
+    /// Codebase patterns from the implement step (via AGENTS.md propagation).
+    /// Empty string if no patterns have been discovered yet.
+    pub agents_md: String,
 }
 
 /// Result of the structured (deterministic) part of the judge.
@@ -291,7 +294,7 @@ fn read_files(
 // Prompt building
 // ─────────────────────────────────────────────────────────────
 
-fn build_judge_prompt(ctx: &JudgeContext, files: &[(String, String)]) -> String {
+pub(crate) fn build_judge_prompt(ctx: &JudgeContext, files: &[(String, String)]) -> String {
     let plan = &ctx.plan;
     let impl_ = &ctx.implementation;
     let review = &ctx.review;
@@ -336,8 +339,30 @@ fn build_judge_prompt(ctx: &JudgeContext, files: &[(String, String)]) -> String 
         }
     }
 
+    let mut agents_md_section = String::new();
+    if !ctx.agents_md.trim().is_empty() {
+        agents_md_section.push_str(&format!(
+            "\n## Codebase Patterns (from prior implement)\n\n{}\n",
+            ctx.agents_md
+        ));
+    }
+
+    let trailing = if agents_md_section.is_empty() { "" } else { "\n" };
+
     format!(
-        "{}\n\n---\n\n## Plan\n\n**Goal:** {}\n\n**DoD criteria:**\n{}\n\n## Implementation\n\n**Branch:** `{}`\n**Commits ({}):**\n{}\n\n## Review\n\n**Findings ({}):**\n{}\n**Assertions ({}/{} passed):**\n{}\n\n## Source files\n{}\n\n---\n\nDecide. Be decisive. Output JSON.",
+        "{}\n\n---\n\n## Plan\n\n**Goal:** {}\n\n**DoD criteria:**\n{}\n\n## Implementation\n\n**Branch:** `{}`
+**Commits ({}):**\n{}
+
+## Review\n\n**Findings ({}):**\n{}
+**Assertions ({}/{} passed):**\n{}
+
+## Source files
+{}
+{}{}
+
+---
+
+Decide. Be decisive. Output JSON.",
         JUDGE_SYSTEM_PROMPT,
         plan.goal,
         dod,
@@ -349,6 +374,8 @@ fn build_judge_prompt(ctx: &JudgeContext, files: &[(String, String)]) -> String 
         passed, total,
         assertions,
         file_section,
+        agents_md_section,
+        trailing,
     )
 }
 
@@ -833,6 +860,7 @@ mod tests {
                     evidence: "1 passed".to_string(),
                 }],
             },
+            agents_md: String::new(),
         }
     }
 
@@ -991,6 +1019,32 @@ mod tests {
         assert!(prompt.contains("tests pass"));
         assert!(prompt.contains("abc1234"));
         assert!(prompt.contains("def fib()"));
+    }
+
+    #[test]
+    fn build_judge_prompt_includes_agents_md_when_nonempty() {
+        // After implement, the loop extracts patterns from ralph's progress.txt
+        // and writes them to AGENTS.md. The Judge prompt MUST surface them so
+        // the LLM can judge against the patterns the implementer discovered.
+        let mut ctx = dummy_ctx();
+        ctx.agents_md =
+            "## Codebase Patterns\n- always run cargo fmt before commit\n- use thiserror for error enums\n".to_string();
+        let prompt = build_judge_prompt(&ctx, &[]);
+        assert!(prompt.contains("Codebase Patterns"),
+            "judge prompt should have Codebase Patterns section, got:\n{}", prompt);
+        assert!(prompt.contains("always run cargo fmt before commit"));
+        assert!(prompt.contains("use thiserror for error enums"));
+    }
+
+    #[test]
+    fn build_judge_prompt_omits_agents_md_section_when_empty() {
+        // First iteration: no AGENTS.md yet. Should NOT include an empty
+        // "## Codebase Patterns" section.
+        let ctx = dummy_ctx();
+        assert!(ctx.agents_md.is_empty());
+        let prompt = build_judge_prompt(&ctx, &[]);
+        assert!(!prompt.contains("## Codebase Patterns"),
+            "empty agents_md should not appear as a section header, got:\n{}", prompt);
     }
 
     #[test]

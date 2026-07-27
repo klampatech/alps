@@ -41,6 +41,9 @@ pub enum ReviewError {
 pub struct ReviewContext {
     pub plan: Plan,
     pub implementation: Implementation,
+    /// Codebase patterns from the implement step (via AGENTS.md propagation).
+    /// Empty string if no patterns have been discovered yet.
+    pub agents_md: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +196,7 @@ fn read_files(
 // Prompt building
 // ─────────────────────────────────────────────────────────────
 
-fn build_review_prompt(ctx: &ReviewContext, files: &[(String, String)]) -> String {
+pub(crate) fn build_review_prompt(ctx: &ReviewContext, files: &[(String, String)]) -> String {
     let plan = &ctx.plan;
     let impl_ = &ctx.implementation;
 
@@ -228,8 +231,28 @@ fn build_review_prompt(ctx: &ReviewContext, files: &[(String, String)]) -> Strin
         }
     }
 
+    let mut agents_md_section = String::new();
+    if !ctx.agents_md.trim().is_empty() {
+        agents_md_section.push_str(&format!(
+            "\n## Codebase Patterns (from prior implement)\n\n{}\n",
+            ctx.agents_md
+        ));
+    }
+
+    let trailing = if agents_md_section.is_empty() { "" } else { "\n" };
+
     format!(
-        "{}\n\n---\n\n## Plan\n\n**Goal:** {}\n\n**Architecture:**\n{}\n\n**Stories:**\n{}\n**DoD criteria:**\n{}\n\n## Implementation\n\n**Branch:** `{}`\n**Commits ({}):**\n{}\n\n## Source files\n{}\n\n---\n\nUSER REQUEST:\nReview the implementation above adversarially. Verify each DoD criterion. Find bugs. Output JSON.",
+        "{}\n\n---\n\n## Plan\n\n**Goal:** {}\n\n**Architecture:**\n{}\n\n**Stories:**\n{}\n**DoD criteria:**\n{}\n\n## Implementation\n\n**Branch:** `{}`
+**Commits ({}):**\n{}
+
+## Source files
+{}
+{}{}
+
+---
+
+USER REQUEST:
+Review the implementation above adversarially. Verify each DoD criterion. Find bugs. Output JSON.",
         REVIEW_SYSTEM_PROMPT,
         plan.goal,
         plan.architecture,
@@ -239,6 +262,8 @@ fn build_review_prompt(ctx: &ReviewContext, files: &[(String, String)]) -> Strin
         impl_.commits.len(),
         commits,
         file_section,
+        agents_md_section,
+        trailing,
     )
 }
 
@@ -462,6 +487,7 @@ mod tests {
                 }],
                 metrics: Default::default(),
             },
+            agents_md: String::new(),
         }
     }
 
@@ -569,6 +595,31 @@ mod tests {
         assert!(prompt.contains("abc1234"));
         assert!(prompt.contains("fib.py"));
         assert!(prompt.contains("def fib(n)"));
+    }
+
+    #[test]
+    fn build_prompt_includes_agents_md_when_nonempty() {
+        // After implement, the loop extracts patterns from ralph's progress.txt
+        // and writes them to AGENTS.md. The Review prompt MUST surface them so
+        // Claude can avoid re-discovering patterns and align with the
+        // implementer's notes.
+        let mut ctx = dummy_ctx();
+        ctx.agents_md = "## Codebase Patterns\n- use foo for bar\n- never baz\n".to_string();
+        let prompt = build_review_prompt(&ctx, &[]);
+        assert!(prompt.contains("Codebase Patterns"), "prompt should have a Codebase Patterns section, got:\n{}", prompt);
+        assert!(prompt.contains("use foo for bar"));
+        assert!(prompt.contains("never baz"));
+    }
+
+    #[test]
+    fn build_prompt_omits_agents_md_section_when_empty() {
+        // First iteration: no AGENTS.md yet (implement hasn't run). The prompt
+        // should NOT include an empty "## Codebase Patterns" section.
+        let ctx = dummy_ctx();
+        assert!(ctx.agents_md.is_empty());
+        let prompt = build_review_prompt(&ctx, &[]);
+        assert!(!prompt.contains("## Codebase Patterns"),
+            "empty agents_md should not appear as a section header, got:\n{}", prompt);
     }
 
     #[test]
