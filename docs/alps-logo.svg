@@ -1,0 +1,104 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 260" role="img" aria-label="ALPS — Agentic Loop Programming System">
+  <title>ALPS — Agentic Loop Programming System</title>
+
+  <defs>
+    <!-- Subtle mountain face gradient -->
+    <linearGradient id="peakFace" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b5b82"/>
+      <stop offset="100%" stop-color="#1e3a5f"/>
+    </linearGradient>
+    <linearGradient id="peakFaceDark" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#2a4566"/>
+      <stop offset="100%" stop-color="#14283f"/>
+    </linearGradient>
+
+    <!-- Snow cap gradient -->
+    <linearGradient id="snow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#e2eaf3"/>
+    </linearGradient>
+
+    <!-- Loop arrow gradient (warm amber) -->
+    <linearGradient id="loop" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%"  stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#fb923c"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background (transparent for README flexibility) -->
+  <rect width="720" height="260" fill="#ffffff"/>
+
+  <!-- ===================== ALPINE PEAKS ===================== -->
+  <!-- Three peaks, decreasing height left→middle→back-right, with overlapping ranges -->
+
+  <!-- Far-right back peak (smaller, lighter) -->
+  <g>
+    <polygon points="470,180 525,90 580,180" fill="url(#peakFaceDark)" opacity="0.85"/>
+    <polygon points="525,90 540,118 525,118 510,118" fill="url(#snow)"/>
+  </g>
+
+  <!-- Middle peak -->
+  <g>
+    <polygon points="340,180 410,80 480,180" fill="url(#peakFace)"/>
+    <!-- Snow cap -->
+    <polygon points="410,80 432,118 410,118 388,118" fill="url(#snow)"/>
+    <!-- Ridge detail -->
+    <line x1="410" y1="80" x2="340" y2="180" stroke="#0f1f33" stroke-width="1" opacity="0.35"/>
+  </g>
+
+  <!-- Front-left tallest peak -->
+  <g>
+    <polygon points="220,180 305,55 390,180" fill="url(#peakFace)"/>
+    <!-- Snow cap, jagged -->
+    <polygon points="305,55 335,108 322,98 305,118 290,102 275,110" fill="url(#snow)"/>
+    <!-- Left ridge shadow -->
+    <polygon points="305,55 220,180 240,180" fill="#14283f" opacity="0.25"/>
+    <!-- Right ridge highlight -->
+    <line x1="305" y1="55" x2="390" y2="180" stroke="#5d7ba0" stroke-width="1.2" opacity="0.5"/>
+  </g>
+
+  <!-- Smaller front-most hill -->
+  <g>
+    <polygon points="150,180 200,130 250,180" fill="#1e3a5f" opacity="0.95"/>
+    <polygon points="200,130 210,148 200,148 190,148" fill="url(#snow)" opacity="0.85"/>
+  </g>
+
+  <!-- Ground line under everything -->
+  <line x1="40" y1="180" x2="680" y2="180" stroke="#1e3a5f" stroke-width="2" opacity="0.4"/>
+
+  <!-- ===================== AGENTIC LOOP ARROW ===================== -->
+  <!-- A clean circular arc that goes OVER the peaks and returns — represents the outer loop -->
+  <g>
+    <!-- The loop itself: an open arc with arrowhead on the right end -->
+    <path d="M 170,150
+             C 170,30  550,30  550,150"
+          fill="none"
+          stroke="url(#loop)"
+          stroke-width="6"
+          stroke-linecap="round"/>
+
+    <!-- Arrowhead at the right end of the arc, pointing back into the mountain (down-left) -->
+    <polygon points="550,150 538,142 542,158" fill="#f59e0b"/>
+
+    <!-- Small dot at the start (where the prompt enters the loop) -->
+    <circle cx="170" cy="150" r="5" fill="#f59e0b"/>
+  </g>
+
+  <!-- ===================== WORDMARK ===================== -->
+  <g font-family="'Inter','Segoe UI','SF Pro Display','Helvetica Neue',sans-serif" font-weight="700">
+    <!-- ALPS -->
+    <text x="360" y="232"
+          text-anchor="middle"
+          font-size="32"
+          letter-spacing="8"
+          fill="#1e3a5f">ALPS</text>
+    <!-- Subtitle -->
+    <text x="360" y="250"
+          text-anchor="middle"
+          font-size="9"
+          letter-spacing="3"
+          fill="#5d7ba0"
+          font-weight="500">AGENTIC LOOP PROGRAMMING SYSTEM</text>
+  </g>
+</svg>
