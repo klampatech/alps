@@ -1,7 +1,7 @@
 # ALPS — Agentic Loop Programming System
 
 <p align="center">
-  <img src="docs/alps-logo.svg" alt="ALPS — Agentic Loop Programming System" width="720">
+  <img src="docs/alps-logo.png" alt="ALPS — Agentic Loop Programming System" width="720">
 </p>
 
 <p align="center">
