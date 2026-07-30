@@ -90,6 +90,7 @@ The key invariant: **the type system encodes the state machine.** Invalid transi
 - 7 successful happy-path smokes (`# ALPS — Done` on the first attempt)
 - 1 Rust DoD smoke (`cargo test --quiet` exit 0, 4/4 stories, 8/8 review assertions)
 - 1 multi-iteration ralph smoke (5 ralph iterations, 4/7 stories → Judge rejected correctly → restart with feedback)
+- 1 real reject-path smoke (CRUD FastAPI app, 4 outer iterations, 3 rejects catching distinct real defects, 4th accepted; SPEC §12 item 1 closed)
 - Workdir guard re-verified on every smoke
 
 **110/110 tests passing.**
@@ -505,7 +506,7 @@ For full rationale, see [`SPEC.md`](SPEC.md) §11.
 ### Known limitations / Open items
 
 - **Mock-CLI agent test fixtures** — currently every test that needs an agent needs the real CLI, making unit tests expensive. A `for_test` closure-pattern is in place for orchestration tests, but LLM-driven agent tests still shell out.
-- **Wider smoke matrix** — Rust `cargo test` path is now verified, but multi-iteration ralph / retry-on-judge-reject paths need broader coverage.
+- **Wider smoke matrix** — Rust `cargo test` and Python CRUD paths are now verified, but multi-iteration ralph + retry-on-judge-reject paths need broader coverage.
 - **Review heuristic extension** — adversarial Review currently approves implementations that satisfy literal AC text but break implicit test wiring (e.g. monkeypatch-vs-default-arg captures). Extending heuristics to specifically check "AC claims X is testable, is it really?" is a v0.7 candidate.
 - **Token-budget vs max-iterations detection** — `ImplementAgent::run`-reads-prd.json handles Ralph exit code 1, but token-budget exhaustion presents differently. Distinguishing "Ralph never iterated cleanly" from "Ralph never produced completion" is a v0.7 candidate.
 
