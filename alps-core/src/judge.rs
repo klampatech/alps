@@ -129,9 +129,13 @@ impl crate::agent::Agent for JudgeAgent {
 /// Config for the LLM judge.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmJudgeConfig {
-    /// Path to the LLM CLI (e.g. "claude", or "hermes" if available).
+    /// Path to the LLM CLI (default: `claude`). Configurable for swapping
+    /// in alternative backends (e.g. a `hermes` CLI if/when one exists).
     pub cli_path: String,
-    /// Model identifier.
+    /// Model identifier. Default is the Claude Code `opus` alias (which on
+    /// this host routes to MiniMax-M3 — Kyle's higher-quality model
+    /// dedicated for the judgment slot). Sub-agents (Plan + Review) stay on
+    /// `claude-sonnet-4` (MiniMax-M2.7) for cheaper/longer-prompt work.
     pub model: String,
     /// Skip files larger than this (bytes).
     pub max_file_bytes: usize,
@@ -139,8 +143,8 @@ pub struct LlmJudgeConfig {
     pub max_total_bytes: usize,
     /// Maximum number of total attempts when the LLM emits invalid JSON.
     /// `1` = no retry (just the original attempt), `3` = 1 original + 2
-    /// retries (default). Only `JudgeError::Parse` triggers a retry; spawn
-    /// errors, schema validation errors, and unknown-verdict errors
+    /// retries (default). Only `JudgeError::Parse` triggers a retry;
+    /// spawn errors, schema validation errors, and unknown-verdict errors
     /// propagate immediately.
     #[serde(default = "default_llm_max_retries")]
     pub max_retries: u32,
@@ -154,7 +158,7 @@ impl Default for LlmJudgeConfig {
     fn default() -> Self {
         LlmJudgeConfig {
             cli_path: "claude".to_string(),
-            model: "claude-sonnet-4".to_string(),
+            model: "claude-opus-4".to_string(),
             max_file_bytes: 50_000,
             max_total_bytes: 500_000,
             max_retries: default_llm_max_retries(),

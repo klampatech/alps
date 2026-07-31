@@ -78,7 +78,7 @@ The key invariant: **the type system encodes the state machine.** Invalid transi
 - ✅ **Plan** → Claude Code (`--dangerously-skip-permissions -p`) with atomic stories + verifiable DoD
 - ✅ **Implement** → `ralph.sh --tool codex` subprocess, idempotent dir setup, per-task branch, real iteration metrics
 - ✅ **Review** → Adversarial Claude with strict JSON output, file:line evidence required
-- ✅ **Judge** → Hybrid `DoDRunner` (cargo/pytest/npm/go test, 120s timeout) + `HermesLlmJudge` (Claude API call)
+- ✅ **Judge** → Hybrid `DoDRunner` (cargo/pytest/npm/go test, 120s timeout) + `HermesLlmJudge` (Claude Code, default model `claude-opus-4` via the Opus alias → MiniMax-M3; was `claude-sonnet-4` prior to 2026-07-30 swap — see SPEC §11.1)
 - ✅ **Reject path** → Restarts at Plan with feedback appended (no feedback-loop loss)
 - ✅ **Per-task branches** → `alps/<task-id>` off `main`, every artifact committed
 - ✅ **AGENTS.md propagation** → Ralph-learned patterns feed back into Review / Judge / next-Plan
@@ -335,7 +335,7 @@ sleep 6 && alps run "..." --workdir /tmp/alps-smoke
 
 5. **Judge** — `JudgeAgent`:
    - **Structured** (`DoDRunner`): detects project type from manifest files, runs the appropriate test command with 120s timeout, captures exit + stderr.
-   - **LLM** (`HermesLlmJudge`): if structured passed, calls Claude API with a focused verdict prompt over the file tree + diff + review findings.
+   - **LLM** (`HermesLlmJudge`): if structured passed, calls Claude Code (`claude --dangerously-skip-permissions -p --model claude-opus-4`) with a focused verdict prompt over the file tree + diff + review findings. As of 2026-07-30 the Judge model is the Opus alias (→ MiniMax-M3 on this host) for the dedicated judgment slot; Plan + Review stay on Sonnet for cheaper sub-agent work. When the wiring was first set (2026-07-26 §11.1), the implementation chose Claude Code over a separate Hermes CLI (which doesn't exist as-shipped) and the `HermesLlmJudge` struct-name stuck for backwards compat. Receipts record `judge_model: "claude-opus-4"` (was `claude-sonnet-4` pre-swap).
    - Returns `Judgment::Pass` only if both clear. Otherwise `Judgment::Reject(Feedback { reason, evidence })`.
 
 6. **Loop** — `loop_::drive` is a recursive function:

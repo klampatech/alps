@@ -34,6 +34,7 @@ what landed in `klampatech/alps` between the spec and now.
 | 2026-07-27 | `d5ea92b` | docs: sync SPEC.md after ralph max-iterations fix + multi-iter smoke |
 | 2026-07-27 | `fd35ff5` | **Recursive artifact collection** — `read_artifacts` now walks `ralph_dir` recursively (was non-recursive `std::fs::read_dir`). Fixes the bug that Hermes Judge couldn't see `src/lib.rs` in the LLM review prompt because Rust source lives in a subdirectory. +1 regression test. Surfaced by the Rust DoD smoke (this §12 item 1, now completed). |
 | 2026-07-30 | (no commit) | **Real reject-path smoke** — first end-to-end smoke to *complete via the reject path*. CRUD FastAPI app at `/tmp/alps-crud-demo/` (4 endpoints, stdlib sqlite3, pytest) reached `# ALPS — Done` in 4 outer-loop iterations and 3 Plan→Implement→Review→Judge round-trips, with each reject catching a distinct real defect: (1) structured DoD missing runtime verification (`pytest -q` + `uvicorn` startup were not asserted-on), (2) captured artifacts (`pytest_output.txt`, `uvicorn_startup.log`) absent + a Pydantic `ItemOut` model introduced despite the spec saying "minimal Pydantic (ItemIn only)", (3) RFC violation: FastAPI's default 204 body handling returned non-empty content under `Response(status_code=204)`. Fourth iteration accepted — 6/6 ralph stories, 11/11 review assertions, 0 critical findings. This is the closed form of §12 item 1 below. |
+| 2026-07-30 | (no commit) | **Judge model swap (claude-sonnet-4 → claude-opus-4)** — `LlmJudgeConfig::default().model` flipped to `claude-opus-4` (Claude Code Opus alias → MiniMax-M3 on this host). Plan + Review stay on `claude-sonnet-4` (MiniMax-M2.7) for cheaper sub-agent work; only the Judge gets the dedicated model. Rationale + naming-history ("HermesLlmJudge" struct-name from original spec-time decision, runtime invokes Claude Code) documented in SPEC §11.1. Direct CLI smoke confirms `claude --model opus` and `claude --model claude-sonnet-4` both work on this host. Receipts now record `judge_model: "claude-opus-4"`. |
 
 ### Verified end-to-end
 
@@ -777,9 +778,36 @@ For MVP, Plan and Review use JSON-output prompts. Implement wraps Ralph. Judge i
 
 ## 11. Resolved Decisions
 
-### 11.1 Judge — Hybrid (verifiable DoD + LLM) — resolved 2026-07-26
+### 11.1 Judge — Hybrid (verifiable DoD + LLM) — resolved 2026-07-26, model swap 2026-07-30
 
-Two-stage:
+- **Two-stage**: structured runner (DoD / cargo test / pytest) + LLM judge.
+  Both must clear for PASS; LLM stage has Critical-only veto.
+- **Implementation**: `HermesLlmJudge` in `alps-core/src/judge.rs`. Spawns
+  `claude --dangerously-skip-permissions -p --model <model>` (Claude Code CLI)
+  with the verdict prompt on stdin. No separate "Hermes" CLI exists; the
+  struct name stuck from the original spec, not from the runtime.
+- **Models** (as of 2026-07-30):
+  - **Judge** = `claude-opus-4` (Opus alias → MiniMax-M3 on this host).
+    Dedicated high-quality model for the judgment slot.
+  - **Plan + Review** = `claude-sonnet-4` (Sonnet → MiniMax-M2.7).
+    Cheaper for the longer structured-output prompts.
+  - Swap rationale: per-attempt cost matters most where the loop is
+    expensive (the judgment that decides accept/reject) so the higher-tier
+    model earns its keep there. Plan + Review are bigger prompts but
+    cheaper in absolute spend.
+- **Failure modes** (see also §12 / Runaway Judge retry):
+  - LLM parse failures → `JudgeError::Parse` → retry up to
+    `max_retries=3` (1 original + 2 retries).
+  - Spawn / schema / unknown-verdict errors → `JudgeError::Llm` →
+    propagate immediately, no retry.
+- **Why named "HermesLlmJudge"**: original spec-time decision (2026-07-26)
+  referenced "Hermes" for the LLM Judge slot. The actual implementation
+  chose Claude Code for the easier subprocess ergonomics. The struct name
+  is preserved for backwards compat. Receipts already record
+  `judge_model: "<real-model-id>"` so cost attribution is accurate
+  regardless of what the code calls the role.
+
+In the original (pre-swap) wording, the two stages were:
 
 1. **Structured pass**: run all `DefinitionOfDone { verifiable: true }` criteria
    deterministically (tests, typecheck, lint, etc.). If any verifiable check fails,
