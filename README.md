@@ -174,7 +174,8 @@ alps --version
 ### Run a task
 
 ```bash
-# Single-task, single-prompt run
+# Single-task, single-prompt run. The deliverable must land INSIDE the workdir
+# (or the recursive artifact walker won't see it and Hermes will reject).
 alps run "Create a Python file fib.py with a function fib(n) that returns the first n Fibonacci numbers as a list. Also create test_fib.py with a pytest test."
 
 # Specify a workdir (defaults to cwd)
@@ -444,15 +445,36 @@ which alps && alps --version   # fail loud if the binary isn't there
 herdr workspace create --cwd /home/kyle/Development/alps --label "alps-smoke"
 # capture pane_id from .result.root_pane.pane_id (e.g. "w9X:p1")
 
-# 2. Fire the alps run. Use a 2-story Python prompt; keep scope small.
-PROMPT='Create a Python file fib.py with a function fib(n) that returns the
-        first n Fibonacci numbers as a list. fib(10) should be [0,1,1,2,3,5,8,13,21,34].
-        Also create test_fib.py with one pytest test that asserts fib(10) equals
-        that list. The test must pass when run with pytest.'
-herdr pane run <pane_id> "clear; alps run \"$PROMPT\" --workdir /tmp/alps-smoke"
+# 2. Write the prompt to a file (NEVER inline multi-line + nested quotes into
+#    `herdr pane run` — gets lost through herdr's dispatch layer; see ALPS
+#    skill Pitfall #15). And keep the deliverable INSIDE the workdir —
+#    the recursive artifact walker only sees files under tasks/<id>/implementation/ralph/.
+cat > /tmp/alps-smoke-prompt.txt << 'EOF'
+Create a Python file fib.py with a function fib(n) that returns the
+first n Fibonacci numbers as a list. fib(10) should be [0,1,1,2,3,5,8,13,21,34].
+Also create test_fib.py with one pytest test that asserts fib(10) equals
+that list. The test must pass when run with pytest.
 
-# 3. Wait for completion (avoids polling)
-herdr wait output <pane_id> --match "ALPS — Done" --timeout 600000
+Write everything inside the workdir (do NOT create files under /tmp/,
+/home/, or any path outside the workdir).
+EOF
+
+# 3. Wrapper script (avoids nested-quote issues through herdr pane run).
+cat > /tmp/alps-smoke-wrapper.sh << 'EOF'
+#!/bin/bash
+set -e
+export PATH="/home/kyle/Development/alps/target/debug:$PATH"
+cd /home/kyle/Development/alps
+exec alps run "$(cat /tmp/alps-smoke-prompt.txt)" --workdir /tmp/alps-smoke
+EOF
+chmod +x /tmp/alps-smoke-wrapper.sh
+
+# 4. Fire the wrapper via herdr. `2>&1 | tee` keeps the log for postmortem.
+herdr pane run <pane_id> "clear; /tmp/alps-smoke-wrapper.sh 2>&1 | tee /tmp/alps-smoke.log"
+
+# 5. Wait for completion (anchored regex — substring matching on "Done" is
+#    too loose and matches incidental lines).
+herdr wait output <pane_id> --match "^# ALPS — Done$" --timeout 600000
 ```
 
 Expected timing (Codex backend, 2-story fib task): ~5 min wall clock total — Plan 30s, Implement 90s, Review 3 min, Judge 5s.
