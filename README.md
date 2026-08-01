@@ -191,6 +191,7 @@ CLI flags:
 | --- | --- |
 | `--workdir <path>` | Where tasks land. Default: `.` |
 | `--force` | Bypass the workdir completion guard |
+| `--deliverable-path <path>` | Where the deliverable actually lives. Default: `--workdir`. See [§ Deliverable outside the workdir](#deliverable-outside-the-workdir). |
 
 ---
 
@@ -294,6 +295,16 @@ cat tasks/<id>/feedback.json | jq .reason
 
 - `"reason": "verifiable DoD criteria failed"` → the structured runner (cargo / pytest / npm / go test) is the failure point. Check the `evidence` field for exit code + stderr.
 - `"reason": "..."` (a long paragraph) → structured passed; the LLM Judge rejected for missing artifacts / context. Check that `read_artifacts` walked recursively and your source files are not in a `SKIP_DIRS` directory.
+
+### Deliverable outside the workdir
+
+If the prompt asks for the deliverable at a path outside `--workdir` (e.g., "build at `/tmp/foo/`"), pass `--deliverable-path /tmp/foo/` so the Judge walks that tree instead of the ralph nested workspace. Without this flag, the LLM Judge sees an empty source-files section and rejects with "Source files section is empty". Added in v0.7.
+
+```bash
+alps run "build a Python FastAPI app at /tmp/foo/" \
+    --workdir /tmp/alps-smoke \
+    --deliverable-path /tmp/foo/
+```
 
 ### The workdir completion guard
 

@@ -84,6 +84,14 @@ pub struct Implementation {
     /// Metrics captured from the Ralph run — iterations, elapsed time, story
     /// completion. Plumbed through to receipts so the user sees real numbers.
     pub metrics: crate::receipt::ImplementMetrics,
+    /// Where the deliverable actually lives. Defaults to the ralph nested
+    /// workspace (`tasks/<id>/implementation/ralph/`). When the prompt
+    /// specifies a target path *outside* `--workdir` (e.g. "build at
+    /// `/tmp/foo/`"), the CLI sets this to that path via `--deliverable-path`
+    /// so `read_artifacts` and the Judge's `read_files` walk the right tree.
+    /// See SPEC §12 item 2 — closes the gap surfaced by the 2026-07-30 CRUD
+    /// smoke v2 (Runtime Pitfall #16 in the alps skill).
+    pub deliverable_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

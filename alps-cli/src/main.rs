@@ -18,7 +18,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use alps_core::domain::{Prompt, TaskId};
-use alps_core::git_ops::{commit_smart, create_branch, CommitOutcome, GitOpsError};
+use alps_core::git_ops::{
+    commit_smart_with_excludes, create_branch, CommitOutcome, GitOpsError,
+};
 use alps_core::implement::ImplementAgent;
 use alps_core::judge::{DoDRunner, HermesLlmJudge, JudgeAgent};
 use alps_core::loop_::drive;
@@ -55,6 +57,17 @@ enum Command {
         /// the previous run completed but you want to try a different prompt.
         #[arg(long)]
         force: bool,
+
+        /// Where the deliverable actually lives. Used by `read_artifacts`
+        /// and the Judge's `read_files` so the LLM review sees the
+        /// actual deliverable code, not just ralph's nested workspace.
+        ///
+        /// Default: `--workdir`. Set this when the prompt says "build at
+        /// `/tmp/foo/`" — point `--deliverable-path` at `/tmp/foo/` and
+        /// alps will walk that tree for the Judge's source-files section.
+        /// See SPEC §12 item 2 / Runtime Pitfall #16.
+        #[arg(long, default_value = "")]
+        deliverable_path: String,
     },
 
     /// List tasks in the current workspace.
@@ -73,8 +86,8 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir, force } => {
-            run_task(prompt, workdir, force).await?;
+        Command::Run { prompt, workdir, force, deliverable_path } => {
+            run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
             eprintln!("alps list: not yet implemented");
@@ -88,9 +101,26 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_task(prompt: String, workdir: String, force: bool) -> Result<()> {
+async fn run_task(
+    prompt: String,
+    workdir: String,
+    force: bool,
+    deliverable_path: String,
+) -> Result<()> {
     let task_id = TaskId::new();
     let workdir = PathBuf::from(workdir);
+
+    // Resolve --deliverable-path. Default = workdir. If empty, we'll fall
+    // through to workdir below so the Judge's read_files sees the workdir
+    // tree (the same behavior as the legacy code). See SPEC §12 item 2.
+    let deliverable_path = if deliverable_path.trim().is_empty() {
+        workdir.clone()
+    } else {
+        PathBuf::from(&deliverable_path)
+    };
+    // Shadow for the second use (commit_smart_with_excludes). The original
+    // binding is moved into ImplementConfig below.
+    let deliverable_path_for_commit = deliverable_path.clone();
 
     // ── Workdir completion guard ──
     // Refuse to start if a previous run completed in this workdir within the
@@ -140,6 +170,17 @@ async fn run_task(prompt: String, workdir: String, force: bool) -> Result<()> {
 
     info!(target: "alps.cli", task_id = %task_id.as_str(), "starting task");
 
+    // Surface the deliverable path so the operator can see which tree the
+    // Judge will walk, especially when --deliverable-path differs from
+    // --workdir. See SPEC §12 item 2.
+    if deliverable_path != workdir {
+        eprintln!(
+            "[alps] deliverable path: {} (workdir: {})",
+            deliverable_path.display(),
+            workdir.display()
+        );
+    }
+
     // Create per-task branch in the workdir so receipts + plan + feedback are
     // tracked in git history. The user can review `alps/<task-id>` to see
     // what alps did for that run, then merge to main or discard.
@@ -180,6 +221,7 @@ async fn run_task(prompt: String, workdir: String, force: bool) -> Result<()> {
         alps_core::implement::ImplementConfig {
             ralph_path,
             claude_prompt_path,
+            deliverable_path,
             ..Default::default()
         },
     );
@@ -198,7 +240,15 @@ async fn run_task(prompt: String, workdir: String, force: bool) -> Result<()> {
             // Auto-commit only if there are changes. Most ALPS runs produce
             // work in tasks/<id>/ which is gitignored, so this is a no-op
             // in practice. The smart check prevents a noisy warning.
-            match commit_smart(&workdir, &format!("done: {}", task_id.as_str())) {
+            match commit_smart_with_excludes(
+                &workdir,
+                &format!("done: {}", task_id.as_str()),
+                if deliverable_path_for_commit != workdir {
+                    Some(deliverable_path_for_commit.as_path())
+                } else {
+                    None
+                },
+            ) {
                 Ok(CommitOutcome::NothingToCommit) => {} // silent — expected
                 Ok(CommitOutcome::Committed) => {
                     eprintln!("[done] auto-committed final state");

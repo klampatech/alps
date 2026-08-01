@@ -293,6 +293,13 @@ mod tests {
 
     /// A canned Implementation that pairs with canned_plan.
     fn canned_implementation(prd_path: std::path::PathBuf) -> Implementation {
+        // The deliverable is conventionally the ralph nested workspace
+        // (tests construct the prd_path there). Use a hardcoded fallback
+        // for the test fixture so we don't double-consume prd_path.
+        let deliverable_path = prd_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"));
         Implementation {
             ralph_branch: "alps/test".to_string(),
             prd_path,
@@ -305,6 +312,7 @@ mod tests {
                 kind: crate::domain::ArtifactKind::Other("python".to_string()),
             }],
             metrics: ImplementMetrics::default(),
+            deliverable_path,
         }
     }
 

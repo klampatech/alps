@@ -104,6 +104,17 @@ pub struct ImplementConfig {
     pub tool: RalphTool,
     /// Optional init command to run before Ralph (e.g. "cargo init --name foo").
     pub init_command: Option<String>,
+    /// Where the deliverable actually lives. The CLI sets this from
+    /// `--deliverable-path` (default = `--workdir`). `read_artifacts` walks
+    /// this tree, and the Judge's `read_files` uses it to resolve source
+    /// files. When the prompt specifies a path outside `--workdir`
+    /// (e.g. "build at `/tmp/foo/`"), this points to that path so the
+    /// Judge sees the real deliverable instead of an empty ralph cwd.
+    /// See SPEC §12 item 2.
+    /// Defaults to `PathBuf::new()` — the sentinel meaning "use ralph_dir".
+    /// The CLI replaces it before the agent runs.
+    #[serde(default)]
+    pub deliverable_path: PathBuf,
 }
 
 fn default_agents_prompt_path() -> PathBuf {
@@ -119,6 +130,7 @@ impl Default for ImplementConfig {
             max_iterations: 20,
             tool: RalphTool::default(),
             init_command: None,
+            deliverable_path: PathBuf::new(),
         }
     }
 }
@@ -164,6 +176,15 @@ impl ImplementAgent {
         self.workspace_root.join("implementation").join("ralph")
     }
 
+    /// Where the actual deliverable lives — the tree the Judge's source-files
+    /// section will walk. Defaults to `ralph_dir()` (the nested ralph
+    /// workspace). When the prompt specifies a target outside `--workdir`,
+    /// the CLI overrides this via `ImplementConfig::deliverable_path`.
+    /// See SPEC §12 item 2.
+    pub fn deliverable_path(&self) -> PathBuf {
+        self.config.deliverable_path.clone()
+    }
+
     /// Derive the task id from the workspace root (the basename of `tasks/<id>`).
     pub fn task_id(&self) -> String {
         self.workspace_root
@@ -197,6 +218,16 @@ impl Agent for ImplementAgent {
 
         let ralph_dir = self.ralph_dir();
         let task_id = self.task_id();
+
+        // Resolve the deliverable path. If the CLI populated it (via
+        // `--deliverable-path`), use it. Otherwise default to ralph_dir
+        // (the legacy behavior, where the deliverable lives inside ralph's
+        // own working copy). See SPEC §12 item 2.
+        let deliverable_path = if self.config.deliverable_path.as_os_str().is_empty() {
+            ralph_dir.clone()
+        } else {
+            self.config.deliverable_path.clone()
+        };
 
         // ── 1. Set up Ralph working directory ──
         std::fs::create_dir_all(&ralph_dir).map_err(|e| ImplementError::RalphSetup(format!(
@@ -331,7 +362,7 @@ venv/
             .map_err(|e| ImplementError::PrdParse(format!("{}: {}", e, prd_text.chars().take(500).collect::<String>())))?;
 
         let commits = read_commits(&ralph_dir)?;
-        let artifacts = read_artifacts(&ralph_dir)?;
+        let artifacts = read_artifacts(&deliverable_path)?;
 
         // Count stories that Ralph marked as passed
         let stories_passed = prd_after.user_stories.iter().filter(|s| s.passes).count() as u32;
@@ -342,9 +373,10 @@ venv/
         let ralph_result = read_ralph_result(&ralph_dir)?;
 
         eprintln!(
-            "[implement] done: {}/{} stories passed, {} commits, {} artifacts, {} iterations, {}s elapsed",
+            "[implement] done: {}/{} stories passed, {} commits, {} artifacts, {} iterations, {}s elapsed (deliverable: {})",
             stories_passed, stories_total, commits.len(), artifacts.len(),
-            ralph_result.iterations, ralph_result.elapsed_secs
+            ralph_result.iterations, ralph_result.elapsed_secs,
+            deliverable_path.display()
         );
 
         Ok(Implementation {
@@ -358,6 +390,7 @@ venv/
                 iterations: ralph_result.iterations,
                 elapsed_secs: ralph_result.elapsed_secs,
             },
+            deliverable_path,
         })
     }
 }
@@ -545,16 +578,22 @@ const SKIP_DIRS: &[&str] = &[
     ".cargo",
 ];
 
-/// Collect every source file under `ralph_dir` recursively. The previous
-/// implementation was non-recursive (`std::fs::read_dir`), which meant
-/// Rust `src/lib.rs`, Go `pkg/foo.go`, etc. were never picked up — the
-/// LLM Judge then rejected the smoke on "Source files section omits
-/// src/lib.rs entirely" (verified 2026-07-27 in the Rust DoD smoke, see
-/// SPEC.md §12 item 1). Now we walk the whole tree, skipping known
-/// noise directories.
-fn read_artifacts(ralph_dir: &Path) -> Result<Vec<Artifact>, ImplementError> {
+/// Collect every source file under the deliverable tree.
+///
+/// When the deliverable path is the nested ralph workspace (the default
+/// case), this matches the v0.6 behavior. When the path is set via
+/// `--deliverable-path`, the walk starts at the user's target tree
+/// instead — closing the gap surfaced by the 2026-07-30 CRUD smoke v2
+/// (Runtime Pitfall #16 in the alps skill).
+///
+/// **Defensive `tasks/` skip:** when a deliverable path is *outside* the
+/// workdir and a parent of it, walking would otherwise descend into
+/// `<deliverable>/tasks/<id>/implementation/ralph/` and re-introduce
+/// ralph's nested git as artifacts. The CLI is responsible for sane
+/// paths, but we skip "tasks" here as a safety net.
+fn read_artifacts(artifacts_root: &Path) -> Result<Vec<Artifact>, ImplementError> {
     let mut artifacts = Vec::new();
-    walk_artifacts(ralph_dir, ralph_dir, &mut artifacts)?;
+    walk_artifacts(artifacts_root, artifacts_root, &mut artifacts)?;
     Ok(artifacts)
 }
 
@@ -576,7 +615,7 @@ fn walk_artifacts(
         }
 
         if path.is_dir() {
-            if SKIP_DIRS.contains(&name) || name.starts_with('.') {
+            if SKIP_DIRS.contains(&name) || name.starts_with('.') || name == "tasks" {
                 continue;
             }
             walk_artifacts(root, &path, artifacts)?;
@@ -936,6 +975,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
+    /// read_artifacts walks the deliverable_path passed in, NOT ralph_dir.
+    /// This is the contract SPEC §12 item 2 establishes: when the operator
+    /// passes --deliverable-path /tmp/foo/, read_artifacts walks /tmp/foo/
+    /// even though ralph's actual files live under
+    /// tasks/<id>/implementation/ralph/. Without this, the Judge's
+    /// source-files section would be empty for any out-of-workdir
+    /// deliverable (verified 2026-07-30, CRUD smoke v2).
+    #[test]
+    fn read_artifacts_walks_deliverable_path_not_ralph_dir() {
+        // Two trees: one is ralph's actual workspace, one is the deliverable.
+        let ralph = std::env::temp_dir().join("alps-test-artifacts-ralphdir");
+        let deliverable = std::env::temp_dir().join("alps-test-artifacts-deliverable");
+        let _ = std::fs::remove_dir_all(&ralph);
+        let _ = std::fs::remove_dir_all(&deliverable);
+        std::fs::create_dir_all(&ralph).unwrap();
+        std::fs::create_dir_all(&deliverable).unwrap();
+
+        // ralph contains ralph.sh and prd.json (the implement agent's own files)
+        std::fs::write(ralph.join("ralph.sh"), "#!/bin/bash\n").unwrap();
+        std::fs::write(ralph.join("prd.json"), "{}").unwrap();
+
+        // deliverable contains the actual app code
+        std::fs::write(deliverable.join("app.py"), "print('hi')\n").unwrap();
+        std::fs::create_dir_all(deliverable.join("tests")).unwrap();
+        std::fs::write(deliverable.join("tests/test_app.py"), "def test(): pass\n").unwrap();
+
+        // Walk the DELIVERABLE tree, not ralph.
+        let artifacts = read_artifacts(&deliverable).unwrap();
+
+        // Must contain deliverable files
+        assert!(artifacts.iter().any(|a| a.path == std::path::PathBuf::from("app.py")));
+        assert!(artifacts.iter().any(|a| a.path == std::path::PathBuf::from("tests/test_app.py")));
+
+        // Must NOT contain ralph's own bookkeeping files (they're not in the
+        // deliverable tree, so they can't be picked up by walking it).
+        let paths: Vec<String> = artifacts.iter().map(|a| a.path.to_string_lossy().into_owned()).collect();
+        assert!(!paths.iter().any(|p| p.contains("ralph.sh")), "ralph.sh leaked: {:?}", paths);
+        assert!(!paths.iter().any(|p| p.contains("prd.json")), "prd.json leaked: {:?}", paths);
+
+        let _ = std::fs::remove_dir_all(&ralph);
+        let _ = std::fs::remove_dir_all(&deliverable);
+    }
+
+    /// read_artifacts defensively skips a `tasks/` directory even if the
+    /// deliverable path is a parent of the workdir. Otherwise the walk
+    /// would descend into `<deliverable>/tasks/<id>/implementation/ralph/`
+    /// and re-introduce ralph's nested git as artifacts. See SPEC §12 item 2.
+    #[test]
+    fn read_artifacts_defensively_skips_tasks_directory() {
+        // Create a tree where the "deliverable" is actually a parent of an
+        // alps workdir (with tasks/ and ralph/ inside). The walk should
+        // skip `tasks/` so it doesn't pick up ralph's nested git.
+        let root = std::env::temp_dir().join("alps-test-artifacts-defensive");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        // The legitimate deliverable file at the top level
+        std::fs::write(root.join("README.md"), "# top-level deliverable\n").unwrap();
+
+        // A `tasks/` subtree that simulates an alps workdir (would re-introduce
+        // ralph's nested git if not skipped).
+        let tasks = root.join("tasks").join("2026-01-01-fake");
+        std::fs::create_dir_all(tasks.join("implementation").join("ralph")).unwrap();
+        std::fs::write(tasks.join("implementation").join("ralph").join("prd.json"), "{}").unwrap();
+        std::fs::write(tasks.join("plan.json"), "{}").unwrap();
+
+        let artifacts = read_artifacts(&root).unwrap();
+
+        // The top-level file IS picked up
+        let paths: Vec<String> = artifacts.iter().map(|a| a.path.to_string_lossy().into_owned()).collect();
+        assert!(
+            paths.iter().any(|p| p == "README.md"),
+            "expected README.md in artifacts, got: {:?}",
+            paths
+        );
+
+        // The tasks/ subtree MUST be skipped — none of its files should
+        // surface as artifacts.
+        assert!(
+            !paths.iter().any(|p| p.contains("tasks/")),
+            "tasks/ leaked into artifacts (defensive skip failed): {:?}",
+            paths
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     // ─────────────────────────────────────────────────────────────
     // Ralph exit-code handling tests (SPEC §12 item #2)
     //
@@ -1038,6 +1164,7 @@ exit 1
                 max_iterations: 5,
                 tool: RalphTool::Codex,
                 init_command: None,
+                deliverable_path: workdir.join("implementation").join("ralph"),
             },
         );
 
@@ -1079,6 +1206,7 @@ exit 1
                 max_iterations: 5,
                 tool: RalphTool::Codex,
                 init_command: None,
+                deliverable_path: workdir.join("implementation").join("ralph"),
             },
         );
 
@@ -1113,6 +1241,7 @@ exit 1
                 max_iterations: 5,
                 tool: RalphTool::Codex,
                 init_command: None,
+                deliverable_path: workdir.join("implementation").join("ralph"),
             },
         );
 
