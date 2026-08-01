@@ -67,6 +67,14 @@ impl TaskWorkspace {
         self.root.join("AGENTS.md")
     }
 
+    /// Path to the implementation.json (the typed `Implementation` struct,
+    /// serialized). Captures the deliverable_path, commits, and artifacts
+    /// so the user can see exactly where the Judge walked. See SPEC §12
+    /// item 2.
+    pub fn implementation_path(&self) -> PathBuf {
+        self.root.join("implementation.json")
+    }
+
     pub fn exists(&self) -> bool {
         self.root.exists()
     }
@@ -105,6 +113,17 @@ impl TaskWorkspace {
         self.ensure_exists()?;
         let json = serde_json::to_string_pretty(receipts)?;
         std::fs::write(self.receipts_path(), json)?;
+        Ok(())
+    }
+
+    /// Persist the typed `Implementation` to `implementation.json`. The CLI
+    /// calls this at the end of the loop so the user can inspect which
+    /// deliverable tree the Judge walked, what commits were made, and
+    /// which artifacts were collected. See SPEC §12 item 2.
+    pub fn write_implementation(&self, impl_: &Implementation) -> Result<(), PersistenceError> {
+        self.ensure_exists()?;
+        let json = serde_json::to_string_pretty(impl_)?;
+        std::fs::write(self.implementation_path(), json)?;
         Ok(())
     }
 
@@ -153,7 +172,11 @@ impl Persistable for Task<Implemented> {
     fn persist_to(&self, workspace: &TaskWorkspace) -> Result<(), PersistenceError> {
         workspace.write_prompt(&self.prompt)?;
         workspace.write_plan(&self.state.plan)?;
-        // Implementation artifacts are written by Ralph itself
+        // Persist the typed Implementation too — captures deliverable_path,
+        // commits, and artifacts. Without this, the user has no durable
+        // record of which tree the Judge walked. See SPEC §12 item 2.
+        workspace.write_implementation(&self.state.implementation)?;
+        // Source artifacts (the actual code) are written by Ralph itself
         Ok(())
     }
 }

@@ -21,30 +21,57 @@ const RALPH_EXCLUDE_PATTERN: &str = "tasks/*/implementation/ralph/";
 /// it's the only layer honored by the directory walker before the
 /// embedded-repo error fires — see the comment in `commit_smart` for details.
 fn ensure_ralph_excluded(dir: &Path) -> Result<(), GitOpsError> {
+    exclude_appended(dir, RALPH_EXCLUDE_PATTERN, "ralph's nested git repo")
+}
+
+/// Ensure `<workdir>/.git/info/exclude` contains a line that excludes the
+/// deliverable path from `git add -A`, but only when the path is
+/// *outside* the workdir. When the user passes `--deliverable-path` that
+/// points somewhere outside the workdir (e.g. `--deliverable-path /tmp/foo/`
+/// with `--workdir /tmp/alps-smoke`), the workdir's auto-commit would
+/// otherwise sweep the deliverable tree in. This appends the relative
+/// path so the workdir's index stays clean. Idempotent. See SPEC §12 item 2.
+fn ensure_deliverable_excluded(dir: &Path, deliverable_path: &Path) -> Result<(), GitOpsError> {
+    // If deliverable_path is the workdir itself (or inside it), there's
+    // nothing to exclude — the operator's tree IS the workdir tree.
+    let canonical_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canonical_deliverable = std::fs::canonicalize(deliverable_path)
+        .unwrap_or_else(|_| deliverable_path.to_path_buf());
+    if canonical_deliverable == canonical_dir
+        || canonical_deliverable.starts_with(&canonical_dir)
+    {
+        return Ok(());
+    }
+    // Outside the workdir. Compute the relative form so the exclude line
+    // is portable across machines (the git exclude file is local). Use a
+    // simple trailing-slash pattern: `dir/to/deliverable/`.
+    let pattern = format!("{}/", canonical_deliverable.display());
+    exclude_appended(dir, &pattern, "deliverable path outside workdir")
+}
+
+/// Shared helper: append a single pattern to `.git/info/exclude` if it
+/// isn't already there. Appends a comment header the first time we add
+/// a new line so the file stays readable.
+fn exclude_appended(dir: &Path, pattern: &str, label: &str) -> Result<(), GitOpsError> {
     let exclude_path = dir.join(".git").join("info").join("exclude");
     if let Some(parent) = exclude_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let existing = std::fs::read_to_string(&exclude_path).unwrap_or_default();
-    if existing
-        .lines()
-        .any(|l| l.trim() == RALPH_EXCLUDE_PATTERN)
-    {
+    if existing.lines().any(|l| l.trim() == pattern) {
         return Ok(());
     }
-    // Ensure the file ends with a newline before appending.
     let mut content = existing;
     if !content.is_empty() && !content.ends_with('\n') {
         content.push('\n');
     }
     content.push_str(&format!(
-        "# alps: exclude ralph's nested git repo (added by commit_smart)\n{}\n",
-        RALPH_EXCLUDE_PATTERN
+        "# alps: exclude {} (added by commit_smart)\n{}\n",
+        label, pattern
     ));
     std::fs::write(&exclude_path, content)?;
     Ok(())
 }
-
 #[derive(Debug, Error)]
 pub enum GitOpsError {
     #[error("git {op} failed: {msg}")]
@@ -69,6 +96,20 @@ pub enum CommitOutcome {
 /// if the working tree is clean. Returns `CommitFailed` (with stderr) if
 /// `git commit` itself failed.
 pub fn commit_smart(dir: &Path, message: &str) -> Result<CommitOutcome, GitOpsError> {
+    commit_smart_with_excludes(dir, message, None)
+}
+
+/// Commit changes in `dir` with `message` if any exist, excluding an
+/// out-of-workdir deliverable path from `git add -A`. Use this when the
+/// CLI sets `--deliverable-path` to a tree outside `--workdir` — without
+/// the exclude, the workdir's auto-commit sweeps the deliverable in.
+/// Pass `None` (or call `commit_smart`) when there's no deliverable path
+/// or it's equal to the workdir. See SPEC §12 item 2.
+pub fn commit_smart_with_excludes(
+    dir: &Path,
+    message: &str,
+    deliverable_path: Option<&Path>,
+) -> Result<CommitOutcome, GitOpsError> {
     // 1. Check porcelain status — empty means nothing to commit.
     let status_output = Command::new("git")
         .args(["status", "--porcelain"])
@@ -105,6 +146,11 @@ pub fn commit_smart(dir: &Path, message: &str) -> Result<CommitOutcome, GitOpsEr
     // already present, so re-runs don't accumulate duplicates.
     if let Err(e) = ensure_ralph_excluded(dir) {
         eprintln!("warning: failed to update .git/info/exclude: {} (commit may fail with embedded-repo error)", e);
+    }
+    if let Some(dp) = deliverable_path {
+        if let Err(e) = ensure_deliverable_excluded(dir, dp) {
+            eprintln!("warning: failed to exclude deliverable path: {} (workdir auto-commit may sweep the deliverable in)", e);
+        }
     }
     let add = Command::new("git")
         .args(["add", "-A"])
@@ -353,6 +399,107 @@ mod tests {
         let current = String::from_utf8_lossy(&out.stdout).trim().to_string();
         assert_eq!(current, "alps/test-task", "expected on new branch, was: {}", current);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// commit_smart_with_excludes adds a line to .git/info/exclude when
+    /// the deliverable path is OUTSIDE the workdir. Without this, the
+    /// workdir's auto-commit would `git add -A` and sweep the entire
+    /// deliverable tree into the workdir's index — disastrous for repos
+    /// with monorepo structure. SPEC §12 item 2.
+    #[test]
+    fn commit_smart_with_excludes_appends_exclude_for_outside_path() {
+        let workdir = unique_dir("exclude-outside");
+        git(&workdir, &["init", "-q"]);
+        git(&workdir, &["config", "user.email", "alps@test"]);
+        git(&workdir, &["config", "user.name", "ALPS"]);
+        // Initial commit so we can stage new files.
+        fs::write(workdir.join("README.md"), "# test\n").unwrap();
+        git(&workdir, &["add", "README.md"]);
+        git(&workdir, &["commit", "-m", "initial"]);
+
+        // Deliverable path is a sibling of workdir, NOT inside it.
+        let deliverable = workdir.parent().unwrap().join(
+            format!("{}-deliverable", workdir.file_name().unwrap().to_str().unwrap())
+        );
+        let _ = fs::remove_dir_all(&deliverable);
+        fs::create_dir_all(&deliverable).unwrap();
+        fs::write(deliverable.join("app.py"), "print('hi')\n").unwrap();
+
+        // Add a tracked file to the workdir so commit_smart has something to do.
+        fs::write(workdir.join("CHANGES.md"), "new content\n").unwrap();
+
+        let outcome = commit_smart_with_excludes(
+            &workdir,
+            "auto: capture changes",
+            Some(&deliverable),
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed);
+
+        // Verify the deliverable path landed in .git/info/exclude.
+        let exclude = fs::read_to_string(workdir.join(".git").join("info").join("exclude"))
+            .unwrap_or_default();
+        let canonical = fs::canonicalize(&deliverable).unwrap();
+        let expected_pattern = format!("{}/", canonical.display());
+        assert!(
+            exclude.contains(&expected_pattern),
+            "expected deliverable path {} in .git/info/exclude, got:\n{}",
+            expected_pattern,
+            exclude
+        );
+
+        // Verify the deliverable file is NOT in the workdir's index.
+        let ls_files = Command::new("git")
+            .args(["ls-files"])
+            .current_dir(&workdir)
+            .output()
+            .unwrap();
+        let files = String::from_utf8_lossy(&ls_files.stdout);
+        assert!(
+            !files.contains("app.py"),
+            "deliverable file leaked into workdir index:\n{}",
+            files
+        );
+
+        let _ = fs::remove_dir_all(&workdir);
+        let _ = fs::remove_dir_all(&deliverable);
+    }
+
+    /// commit_smart_with_excludes is a no-op when the deliverable path is
+    /// equal to or inside the workdir. The operator's tree IS the workdir
+    /// tree, so excluding it would be wrong.
+    #[test]
+    fn commit_smart_with_excludes_noop_when_deliverable_inside_workdir() {
+        let workdir = unique_dir("exclude-inside");
+        git(&workdir, &["init", "-q"]);
+        git(&workdir, &["config", "user.email", "alps@test"]);
+        git(&workdir, &["config", "user.name", "ALPS"]);
+        fs::write(workdir.join("README.md"), "# test\n").unwrap();
+        git(&workdir, &["add", "README.md"]);
+        git(&workdir, &["commit", "-m", "initial"]);
+
+        // Deliverable path equals workdir
+        fs::write(workdir.join("CHANGES.md"), "new content\n").unwrap();
+        let outcome = commit_smart_with_excludes(
+            &workdir,
+            "auto: capture changes",
+            Some(&workdir),
+        )
+        .unwrap();
+        assert_eq!(outcome, CommitOutcome::Committed);
+
+        // The exclude file should not contain the workdir path.
+        let exclude = fs::read_to_string(workdir.join(".git").join("info").join("exclude"))
+            .unwrap_or_default();
+        let canonical = fs::canonicalize(&workdir).unwrap();
+        let unexpected_pattern = format!("{}/", canonical.display());
+        assert!(
+            !exclude.contains(&unexpected_pattern),
+            "workdir itself was excluded (should not be):\n{}",
+            exclude
+        );
+
+        let _ = fs::remove_dir_all(&workdir);
     }
 
     #[test]

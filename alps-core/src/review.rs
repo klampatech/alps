@@ -254,10 +254,18 @@ fn read_files(
     impl_: &Implementation,
     config: &ReviewConfig,
 ) -> Result<Vec<(String, String)>, ReviewError> {
-    let ralph_dir = impl_
-        .prd_path
-        .parent()
-        .ok_or_else(|| ReviewError::Schema(format!("prd_path has no parent: {:?}", impl_.prd_path)))?;
+    // Walk the deliverable tree, not the ralph nested workspace. When the
+    // CLI sets `--deliverable-path`, this points at the user's actual
+    // target (e.g. `/tmp/foo/`); otherwise it falls back to ralph_dir
+    // (the legacy behavior). See SPEC §12 item 2.
+    let artifacts_root = if impl_.deliverable_path.as_os_str().is_empty() {
+        impl_
+            .prd_path
+            .parent()
+            .ok_or_else(|| ReviewError::Schema(format!("prd_path has no parent: {:?}", impl_.prd_path)))?
+    } else {
+        impl_.deliverable_path.as_path()
+    };
 
     let mut files = Vec::new();
     let mut total = 0usize;
@@ -266,7 +274,7 @@ fn read_files(
         if total >= config.max_total_bytes {
             break;
         }
-        let path = ralph_dir.join(&artifact.path);
+        let path = artifacts_root.join(&artifact.path);
         if !path.is_file() {
             continue;
         }
@@ -595,6 +603,7 @@ mod tests {
                     kind: ArtifactKind::Source,
                 }],
                 metrics: Default::default(),
+                deliverable_path: PathBuf::from("/tmp/alps-review-fixture"),
             },
             agents_md: String::new(),
         }
