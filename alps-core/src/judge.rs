@@ -761,7 +761,19 @@ impl StructuredJudge for DoDRunner {
             return Ok(StructuredResult { all_pass: true, failed: vec![] });
         }
 
-        let project_type = detect_project_type(ralph_dir);
+        // Walk the deliverable tree, not the ralph nested workspace. When
+        // the CLI sets `--deliverable-path`, this points at the user's
+        // actual target (e.g. `/tmp/foo/`); otherwise it falls back to
+        // `ralph_dir` (the legacy behavior). See SPEC §12 item 7 — closes
+        // the gap surfaced by the 2026-08-01 Node smoke (Runtime Pitfall
+        // #18 in the alps skill).
+        let detect_root = if ctx.implementation.deliverable_path.as_os_str().is_empty() {
+            ralph_dir
+        } else {
+            ctx.implementation.deliverable_path.as_path()
+        };
+
+        let project_type = detect_project_type(detect_root);
         eprintln!("[judge:structured] detected project type: {}", project_type);
 
         if matches!(project_type, ProjectType::Unknown) {
@@ -772,7 +784,7 @@ impl StructuredJudge for DoDRunner {
         let (cmd, args) = test_command_for(&project_type);
         eprintln!("[judge:structured] running: {} {}", cmd, args.join(" "));
 
-        let result = run_cmd_with_timeout(ralph_dir, cmd, &args, self.config.timeout_secs).await?;
+        let result = run_cmd_with_timeout(detect_root, cmd, &args, self.config.timeout_secs).await?;
 
         if result.success {
             eprintln!("[judge:structured] PASS");
@@ -1307,11 +1319,15 @@ mod tests {
 
     #[tokio::test]
     async fn dod_runner_unknown_project_skips() {
+        // ralph_dir has no project markers (only README.md), and
+        // deliverable_path is empty → runner should fall back to ralph_dir
+        // and skip DoD checks.
         let dir = make_tmp_dir();
         std::fs::write(dir.join("README.md"), "# readme").unwrap();
         let ctx = JudgeContext {
             implementation: crate::domain::Implementation {
                 prd_path: dir.join("prd.json"),
+                deliverable_path: PathBuf::new(),
                 ..impl_dummy()
             },
             ..dummy_ctx()
@@ -1320,6 +1336,117 @@ mod tests {
         let result = runner.check(&ctx).await.unwrap();
         assert!(result.all_pass);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn dod_runner_detect_uses_rust_at_deliverable_path() {
+        // ralph_dir is empty (no Cargo.toml there), but the deliverable
+        // path has one. Runner should detect Rust at the deliverable
+        // path, not at ralph_dir. Smoke4-style (Python + Rust libs from
+        // the same alps run) depended on this — the previous
+        // `detect_project_type(ralph_dir)` would miss Rust when the
+        // Rust crate lives in the deliverable tree.
+        let ralph_dir = make_tmp_dir();
+        let deliverable = make_tmp_dir();
+        std::fs::write(deliverable.join("Cargo.toml"), "[package]").unwrap();
+        let ctx = JudgeContext {
+            implementation: crate::domain::Implementation {
+                prd_path: ralph_dir.join("prd.json"),
+                deliverable_path: deliverable.clone(),
+                ..impl_dummy()
+            },
+            ..dummy_ctx()
+        };
+        let runner = DoDRunner::new();
+        let result = runner.check(&ctx).await.unwrap();
+        // We don't assert PASS — cargo test will fail in this tmp dir
+        // because there's no src/lib.rs. We only assert that the
+        // detection walked the deliverable: the result should NOT be
+        // `all_pass` from the "Unknown → skip" short-circuit, so it
+        // should be `all_pass: false` from a real cargo invocation.
+        assert!(!result.all_pass, "should have run cargo test, not skipped");
+        std::fs::remove_dir_all(&ralph_dir).ok();
+        std::fs::remove_dir_all(&deliverable).ok();
+    }
+
+    #[tokio::test]
+    async fn dod_runner_detect_uses_node_at_deliverable_path() {
+        // ralph_dir is empty, deliverable has a package.json. The
+        // previous behavior (detect on ralph_dir) would return Unknown
+        // and short-circuit — the LLM Judge was the only verifier. After
+        // this fix, the structured DoD should attempt to run npm test
+        // (and fail because the tmp package.json has no test script,
+        // proving the structured path actually fired).
+        let ralph_dir = make_tmp_dir();
+        let deliverable = make_tmp_dir();
+        std::fs::write(deliverable.join("package.json"), r#"{"name":"x","version":"0.0.0"}"#).unwrap();
+        let ctx = JudgeContext {
+            implementation: crate::domain::Implementation {
+                prd_path: ralph_dir.join("prd.json"),
+                deliverable_path: deliverable.clone(),
+                ..impl_dummy()
+            },
+            ..dummy_ctx()
+        };
+        let runner = DoDRunner::new();
+        let result = runner.check(&ctx).await.unwrap();
+        // npm test will exit non-zero on the bare package.json
+        // (Missing script: "test"), so all_pass should be false. This
+        // proves the structured path actually invoked npm — pre-fix,
+        // this would have been all_pass: true from the Unknown
+        // short-circuit.
+        assert!(!result.all_pass, "structured npm path should have fired");
+        std::fs::remove_dir_all(&ralph_dir).ok();
+        std::fs::remove_dir_all(&deliverable).ok();
+    }
+
+    #[tokio::test]
+    async fn dod_runner_detect_uses_go_at_deliverable_path() {
+        // ralph_dir is empty, deliverable has a go.mod. Pre-fix this
+        // would be Unknown → skip. Post-fix the structured runner
+        // should attempt `go test ./...` (and fail because there's no
+        // Go source, proving the path fired).
+        let ralph_dir = make_tmp_dir();
+        let deliverable = make_tmp_dir();
+        std::fs::write(deliverable.join("go.mod"), "module x\n\ngo 1.21\n").unwrap();
+        let ctx = JudgeContext {
+            implementation: crate::domain::Implementation {
+                prd_path: ralph_dir.join("prd.json"),
+                deliverable_path: deliverable.clone(),
+                ..impl_dummy()
+            },
+            ..dummy_ctx()
+        };
+        let runner = DoDRunner::new();
+        let result = runner.check(&ctx).await.unwrap();
+        assert!(!result.all_pass, "structured go path should have fired");
+        std::fs::remove_dir_all(&ralph_dir).ok();
+        std::fs::remove_dir_all(&deliverable).ok();
+    }
+
+    #[tokio::test]
+    async fn dod_runner_falls_back_to_ralph_dir_when_deliverable_empty() {
+        // Empty deliverable_path → runner should probe ralph_dir (legacy
+        // behavior preserved). Set a package.json AT ralph_dir to prove
+        // the fallback works. Pre-fix and post-fix this is the same
+        // behavior; this test pins the contract.
+        let ralph_dir = make_tmp_dir();
+        std::fs::write(ralph_dir.join("package.json"), r#"{"name":"x","version":"0.0.0"}"#).unwrap();
+        let ctx = JudgeContext {
+            implementation: crate::domain::Implementation {
+                prd_path: ralph_dir.join("prd.json"),
+                deliverable_path: PathBuf::new(),
+                ..impl_dummy()
+            },
+            ..dummy_ctx()
+        };
+        let runner = DoDRunner::new();
+        let result = runner.check(&ctx).await.unwrap();
+        // npm test will fail (no test script) → all_pass: false,
+        // proving we hit the structured path via the ralph_dir
+        // fallback.
+        assert!(!result.all_pass, "structured npm path via ralph_dir should have fired");
+        std::fs::remove_dir_all(&ralph_dir).ok();
     }
 
     fn impl_dummy() -> crate::domain::Implementation {
