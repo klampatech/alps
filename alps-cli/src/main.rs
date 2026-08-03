@@ -23,6 +23,8 @@ use alps_core::git_ops::{
 };
 use alps_core::implement::ImplementAgent;
 use alps_core::judge::{DoDRunner, HermesLlmJudge, JudgeAgent};
+
+mod detect;
 use alps_core::loop_::drive;
 use alps_core::persistence::TaskWorkspace;
 use alps_core::plan::PlanAgent;
@@ -113,8 +115,19 @@ async fn run_task(
     // Resolve --deliverable-path. Default = workdir. If empty, we'll fall
     // through to workdir below so the Judge's read_files sees the workdir
     // tree (the same behavior as the legacy code). See SPEC §12 item 2.
+    //
+    // §12 item 1C (2026-08-03): if the operator passed an empty flag and
+    // the prompt mentions a build path, auto-detect it. This closes the
+    // common operator-forget case where `--deliverable-path` is missing
+    // and Hermes rejects on "Source files section is empty" (Pitfall #16).
     let deliverable_path = if deliverable_path.trim().is_empty() {
-        workdir.clone()
+        match detect::detect(&prompt, &workdir) {
+            Some(detected) => {
+                eprintln!("[detect] auto-detected deliverable-path: {}", detected.display());
+                detected
+            }
+            None => workdir.clone(),
+        }
     } else {
         PathBuf::from(&deliverable_path)
     };
