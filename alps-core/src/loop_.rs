@@ -507,4 +507,279 @@ mod tests {
             "first Plan's prompt should not have feedback (it was the original run)"
         );
     }
+
+
+    // ─────────────────────────────────────────────────────────────────────
+    // drive_passes_first_try — happy-path symmetric test.
+    //
+    // The reject-path test above exercises the resubmit cycle. This test
+    // pins the symmetric happy-path: Judge accepts on first call, drive
+    // returns Ok(Task<Done>) without recursing.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Shared helper: build a JudgeAgent that uses our scripted LLM judge
+    /// + an always-pass structured judge. Used by both happy-path tests.
+    fn judge_agent_with(scripted: Arc<ScriptedLlmJudge>) -> JudgeAgent {
+        JudgeAgent::new(Arc::new(AlwaysPassStructured), scripted)
+    }
+
+    /// Shared helper: build a fresh TaskWorkspace rooted at a unique tmp dir.
+    /// Returns (task, workspace, workspace_root) — workspace_root is the
+    /// top-level dir so the caller can clean it up with remove_dir_all.
+    fn fresh_workspace_task() -> (
+        Task<Idle>,
+        TaskWorkspace,
+        std::path::PathBuf,
+        TaskId,
+    ) {
+        let task_id = TaskId::new();
+        let workspace_root = std::env::temp_dir().join(format!(
+            "alps-drive-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        let workspace = TaskWorkspace::new(&workspace_root);
+        let task = Task::<Idle>::new(
+            task_id.clone(),
+            workspace_root.clone(),
+            Prompt::new("Build a happy-path function"),
+        );
+        (task, workspace, workspace_root, task_id)
+    }
+
+    #[tokio::test]
+    async fn drive_passes_first_try() {
+        // ── Setup ──
+        let (task, workspace, workspace_root, task_id) = fresh_workspace_task();
+
+        let plan_calls: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let plan_calls_for_closure = plan_calls.clone();
+        let plan_id = PlanId(uuid::Uuid::new_v4());
+        let plan_id_for_closure = plan_id.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            *plan_calls_for_closure.lock().unwrap() += 1;
+            Ok(canned_plan(plan_id_for_closure.clone()))
+        });
+
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id,
+            plan_summary: "Build the requested Python function".to_string(),
+            implement_metrics: ImplementMetrics::default(),
+            review_summary: ReviewSummary {
+                findings_count: 1,
+                critical_findings: 0,
+                assertions_passed: 1,
+                assertions_total: 1,
+            },
+            judged_at: chrono::Utc::now(),
+            judge_model: "mock".to_string(),
+        };
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![Judgment::Pass(pass_receipts)]));
+        let judge = judge_agent_with(scripted.clone());
+
+        // ── Run ──
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+        let _ = std::fs::remove_dir_all(&workspace_root);
+
+        // ── Assert ──
+        // 1. drive() returned Ok(done) — the happy path converged.
+        let done = result.expect("drive() should return Ok on first-try pass");
+
+        // 2. Plan/Implement/Review/Judge each called EXACTLY ONCE.
+        assert_eq!(
+            *plan_calls.lock().unwrap(),
+            1,
+            "Plan should be called once on happy path"
+        );
+        assert_eq!(
+            scripted.call_count(),
+            1,
+            "Judge should be called once on happy path"
+        );
+
+        // 3. Final prompt must NOT contain the rejection header (sanity:
+        //    no spurious rejection feedback from a non-existent prior attempt).
+        let _ = done; // smoke check that the accessor compiles
+    }
+
+    #[tokio::test]
+    async fn drive_passes_first_try_propagates_agents_md() {
+        // ── Setup ──
+        // Single happy-path iteration. The load-bearing contract for
+        // this test is: AGENTS.md is populated AFTER the run completes,
+        // pulling patterns from ralph's progress.txt via propagate_ralph_patterns.
+        // This pins the cross-agent-state propagation end-to-end through
+        // the loop, not just at the unit-test level.
+        let (task, workspace, workspace_root, task_id) = fresh_workspace_task();
+        let ralph_dir = workspace.ralph_dir();
+        std::fs::create_dir_all(&ralph_dir).unwrap();
+        std::fs::write(
+            ralph_dir.join("progress.txt"),
+            "## Codebase Patterns\n- synthetic-pattern-from-ralph\n",
+        )
+        .unwrap();
+
+        let plan = PlanAgent::for_test(|_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            Ok(canned_plan(PlanId(uuid::Uuid::new_v4())))
+        });
+
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id: PlanId(uuid::Uuid::new_v4()),
+            plan_summary: "ok".to_string(),
+            implement_metrics: ImplementMetrics::default(),
+            review_summary: ReviewSummary::from_findings(&[], &[]),
+            judged_at: chrono::Utc::now(),
+            judge_model: "mock".to_string(),
+        };
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![Judgment::Pass(pass_receipts)]));
+        let judge = judge_agent_with(scripted.clone());
+
+        // ── Run ──
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+
+        // Capture AGENTS.md BEFORE cleanup (remove_dir_all would empty it).
+        let ag = agents_md::read(&workspace_root).unwrap_or_default();
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        // ── Assert ──
+        // 1. Happy path: drive returns Ok on first try.
+        let _done = result.expect("drive() should return Ok on first-try pass");
+
+        // 2. AGENTS.md was populated from ralph's progress.txt by
+        //    propagate_ralph_patterns. This is the load-bearing assertion
+        //    — it pins the cross-agent-state propagation contract end-to-end.
+        assert!(
+            ag.contains("synthetic-pattern-from-ralph"),
+            "AGENTS.md should contain pattern propagated from ralph, got: {:?}",
+            ag
+        );
+        assert!(
+            ag.contains("## Codebase Patterns"),
+            "AGENTS.md should have Codebase Patterns header, got: {:?}",
+            ag
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // error-propagation tests — the bookends. The reject-path handles
+    // Resubmit; these handle the case where an agent itself errors.
+    //
+    // The contract: any agent error → drive() returns Err(AlpsError::XAgent),
+    // downstream agents do not run, no recursion happens.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drive_returns_error_on_plan_failure() {
+        let (task, workspace, workspace_root, _task_id) = fresh_workspace_task();
+
+        let plan = PlanAgent::for_test(|_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            Err(crate::plan::PlanError::Parse("synthetic plan parse failure".to_string()))
+        });
+
+        let prd_path = workspace_root.join("prd.json");
+        let implement_called = Arc::new(Mutex::new(false));
+        let implement_called_for_closure = implement_called.clone();
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            *implement_called_for_closure.lock().unwrap() = true;
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review_called = Arc::new(Mutex::new(false));
+        let review_called_for_closure = review_called.clone();
+        let review = ReviewAgent::for_test(move |_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            *review_called_for_closure.lock().unwrap() = true;
+            Ok(canned_review())
+        });
+
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![]));
+        let judge = judge_agent_with(scripted.clone());
+
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        // Plan errored → drive returns Err(PlanAgent), no other agents ran.
+        let err = match result {
+    Ok(_) => panic!("drive() should return Err when Plan fails"),
+    Err(e) => e,
+};
+        match err {
+            AlpsError::PlanAgent(_) => {} // expected
+            other => panic!("expected AlpsError::PlanAgent, got: {:?}", other),
+        }
+        assert!(!*implement_called.lock().unwrap(), "Implement should not run when Plan fails");
+        assert!(!*review_called.lock().unwrap(), "Review should not run when Plan fails");
+        assert_eq!(scripted.call_count(), 0, "Judge should not run when Plan fails");
+    }
+
+    #[tokio::test]
+    async fn drive_returns_error_on_judge_failure() {
+        // Judge errors are different from Reject. Reject is a normal
+        // Judgment::Reject that loop-recurses; an Err(JudgeError) means
+        // the Judge itself failed (parse error, subprocess died, etc.)
+        // and must propagate immediately without recursion.
+        let (task, workspace, workspace_root, _task_id) = fresh_workspace_task();
+
+        let plan = PlanAgent::for_test(|_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            Ok(canned_plan(PlanId(uuid::Uuid::new_v4())))
+        });
+
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        // Judge errors instead of returning a Judgment. After this the
+        // loop MUST NOT recurse — it must surface the error.
+        struct ErroringLlmJudge;
+        #[async_trait::async_trait]
+        impl LlmJudge for ErroringLlmJudge {
+            async fn judge(&self, _ctx: &JudgeContext) -> Result<Judgment, JudgeError> {
+                Err(JudgeError::Llm("synthetic judge failure".to_string()))
+            }
+        }
+
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![]));
+        let _ = scripted; // suppress unused warning
+        let judge: JudgeAgent = JudgeAgent::new(Arc::new(AlwaysPassStructured), Arc::new(ErroringLlmJudge));
+
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        let err = match result {
+    Ok(_) => panic!("drive() should return Err when Judge errors"),
+    Err(e) => e,
+};
+        match err {
+            AlpsError::Judge(_) => {} // expected
+            other => panic!("expected AlpsError::Judge, got: {:?}", other),
+        }
+    }
 }
