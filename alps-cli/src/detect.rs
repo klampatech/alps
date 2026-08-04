@@ -99,6 +99,10 @@ fn collect_candidates(prompt: &str) -> Vec<PathBuf> {
         while let Some(idx) = lower[search_from..].find(keyword) {
             let absolute_idx = search_from + idx + keyword.len();
             if let Some(p) = extract_abs_path(&prompt[absolute_idx..]) {
+                if !is_viable_candidate(&p) {
+                    search_from = absolute_idx;
+                    continue;
+                }
                 let key = p.to_string_lossy().to_string();
                 let count = seen_counts.entry(key.clone()).or_insert(0);
                 if *count == 0 {
@@ -117,6 +121,23 @@ fn collect_candidates(prompt: &str) -> Vec<PathBuf> {
         cb.cmp(&ca)
     });
     out
+}
+
+/// True if `p` is a viable deliverable-path candidate. We reject paths that
+/// are too short to be a real deliverable — typically these are noise from
+/// guard lines like "do NOT create files under /tmp/" where the keyword
+/// `under` matches but the path is just a system root (e.g. `/tmp/`).
+///
+/// Reject if the path has zero or one meaningful components. A real
+/// deliverable is at least `/parent/leaf` (two components). The trailing
+/// slash counts as a non-component; we strip it before counting.
+fn is_viable_candidate(p: &Path) -> bool {
+    let stripped = p.to_string_lossy().trim_end_matches('/').to_string();
+    if stripped.is_empty() {
+        return false;
+    }
+    let components = stripped.split('/').filter(|c| !c.is_empty()).count();
+    components >= 2
 }
 
 /// Given a string starting right after a keyword, extract the absolute
@@ -259,5 +280,30 @@ mod tests {
         let p = "Build at `/tmp/qux-app` for testing";
         let d = detect(p, Path::new("/tmp/workdir")).unwrap();
         assert_eq!(d, PathBuf::from("/tmp/qux-app"));
+    }
+
+    #[test]
+    fn rejects_single_component_paths() {
+        // The prompt template's guard line says "do NOT create files under
+        // /tmp/" — the keyword `under` matches and /tmp/ is technically a valid
+        // absolute path. But it's a system root, not a deliverable. The
+        // viability filter rejects single-component paths so /tmp/ doesn't
+        // win over the actual deliverable /tmp/foo.
+        assert!(detect("do NOT create files under /tmp/", Path::new("/tmp/workdir")).is_none());
+        assert!(detect("nothing to see at /tmp", Path::new("/tmp/workdir")).is_none());
+        assert!(detect("look at /home", Path::new("/tmp/workdir")).is_none());
+    }
+
+    #[test]
+    fn guard_line_does_not_override_real_deliverable() {
+        // The OP smoke that prompted this fix: the prompt-template guard line
+        // includes "do NOT create files under /tmp/" but the actual deliverable
+        // is /tmp/foo. Before the viability filter, the auto-detect picked
+        // /tmp/ as the deliverable path, and the Judge's read_artifacts walked
+        // /tmp/ (choking on /tmp/systemd-private-*). The fix: skip paths with
+        // fewer than 2 components so /tmp/ is ignored and /tmp/foo wins.
+        let p = "Build a Python app at /tmp/foo. Write everything inside the workdir (do NOT create files under /tmp/).";
+        let d = detect(p, Path::new("/tmp/workdir")).unwrap();
+        assert_eq!(d, PathBuf::from("/tmp/foo"));
     }
 }
