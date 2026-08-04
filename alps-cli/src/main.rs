@@ -121,12 +121,24 @@ async fn run_task(
     // common operator-forget case where `--deliverable-path` is missing
     // and Hermes rejects on "Source files section is empty" (Pitfall #16).
     let deliverable_path = if deliverable_path.trim().is_empty() {
+        // Auto-detect: if the prompt mentions a build path, use it. Otherwise
+        // the deliverable is the ralph nested git at
+        // workdir/tasks/<task_id>/implementation/ralph/. Setting it to
+        // workdir here would make the Judge's read_artifacts walk the
+        // workdir root (which doesn't contain the code — the code lives in
+        // tasks/<id>/implementation/ralph/). The legacy fallback inside
+        // read_artifacts (deliverable_path empty → prd_path.parent() →
+        // ralph_dir) is the right behavior here.
         match detect::detect(&prompt, &workdir) {
             Some(detected) => {
                 eprintln!("[detect] auto-detected deliverable-path: {}", detected.display());
                 detected
             }
-            None => workdir.clone(),
+            None => {
+                let ralph_default = workdir.join("tasks").join(task_id.as_str()).join("implementation").join("ralph");
+                eprintln!("[detect] no viable prompt-derived path; using ralph nested git: {}", ralph_default.display());
+                ralph_default
+            }
         }
     } else {
         PathBuf::from(&deliverable_path)
