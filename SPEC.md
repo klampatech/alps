@@ -1,14 +1,16 @@
 # ALPS — Specification
 
-> **Status**: v0.1 implemented + working; reject path verified; agent retries in place; ralph max-iterations routes through Judge
+> **Status**: v0.7.2 — orchestrator working end-to-end for Python, Rust, Node, Go; reject path verified in production; agent retries in place; ralph max-iterations routes through Judge; per-task branches + AGENTS.md propagation + workdir guard + nested-git exclude + recursive artifact walker + `--deliverable-path` flag + auto-detect deliverable path shipped. 118/118 tests passing.
 > **Author**: Kyle + Evo
-> **Date**: 2026-07-26 (initial); 2026-07-27 (updated for v0.1 implementation)
+> **Date**: 2026-07-26 (initial); 2026-07-27 (v0.1 implementation); 2026-08-03 (v0.7.2 — major architectural drift cleanup, this revision)
 
 ## 0. What's been built since the original spec
 
-The v0.1 spec was written before any code shipped. As of 2026-07-27, the
-core loop is implemented and working end-to-end. Below is the changelog of
-what landed in `klampatech/alps` between the spec and now.
+The v0.1 spec was written before any code shipped. As of 2026-08-03, the
+core loop is implemented and working end-to-end across four project types
+(Python, Rust, Node, Go), with the full reject path verified in production.
+Below is the changelog of what landed in `klampatech/alps` between the spec
+and now.
 
 | Date | Commit | What it added |
 |---|---|---|
@@ -35,12 +37,18 @@ what landed in `klampatech/alps` between the spec and now.
 | 2026-07-27 | `fd35ff5` | **Recursive artifact collection** — `read_artifacts` now walks `ralph_dir` recursively (was non-recursive `std::fs::read_dir`). Fixes the bug that Hermes Judge couldn't see `src/lib.rs` in the LLM review prompt because Rust source lives in a subdirectory. +1 regression test. Surfaced by the Rust DoD smoke (this §12 item 1, now completed). |
 | 2026-07-30 | (no commit) | **Real reject-path smoke** — first end-to-end smoke to *complete via the reject path*. CRUD FastAPI app at `/tmp/alps-crud-demo/` (4 endpoints, stdlib sqlite3, pytest) reached `# ALPS — Done` in 4 outer-loop iterations and 3 Plan→Implement→Review→Judge round-trips, with each reject catching a distinct real defect: (1) structured DoD missing runtime verification (`pytest -q` + `uvicorn` startup were not asserted-on), (2) captured artifacts (`pytest_output.txt`, `uvicorn_startup.log`) absent + a Pydantic `ItemOut` model introduced despite the spec saying "minimal Pydantic (ItemIn only)", (3) RFC violation: FastAPI's default 204 body handling returned non-empty content under `Response(status_code=204)`. Fourth iteration accepted — 6/6 ralph stories, 11/11 review assertions, 0 critical findings. This is the closed form of §12 item 1 below. |
 | 2026-07-30 | (no commit) | **Judge model swap (claude-sonnet-4 → claude-opus-4)** — `LlmJudgeConfig::default().model` flipped to `claude-opus-4` (Claude Code Opus alias → MiniMax-M3 on this host). Plan + Review stay on `claude-sonnet-4` (MiniMax-M2.7) for cheaper sub-agent work; only the Judge gets the dedicated model. Rationale + naming-history ("HermesLlmJudge" struct-name from original spec-time decision, runtime invokes Claude Code) documented in SPEC §11.1. Direct CLI smoke confirms `claude --model opus` and `claude --model claude-sonnet-4` both work on this host. Receipts now record `judge_model: "claude-opus-4"`. |
-| 2026-08-01 | (this commit) | **--deliverable-path flag** — closes §12 item 2 / Runtime Pitfall #16. CLI flag defaults to `--workdir`; when set to a path outside the workdir, `read_artifacts` walks that path, the Judge/Review follow suit, and `commit_smart_with_excludes` appends the path to `.git/info/exclude`. +4 tests (110 → 114). |
+| 2026-08-01 | \ (PR #2) | **--deliverable-path flag** — closes §12 item 2 / Runtime Pitfall #16. CLI flag defaults to `--workdir`; when set to a path outside the workdir, `read_artifacts` walks that path, the Judge/Review follow suit, and `commit_smart_with_excludes` appends the path to `.git/info/exclude`. +4 tests (110 → 114). |
+| 2026-08-02 | `0d840c1` (PR #3) | **`detect_project_type` walks `--deliverable-path`** — `DoDRunner::check` previously called `detect_project_type(ralph_dir)` which never contained `package.json` or `go.mod` (ralph nested git). Now resolves `detect_root` from `Implementation.deliverable_path` (falling back to `ralph_dir` when empty). `run_cmd_with_timeout` runs in `detect_root` so `npm test` / `go test ./...` execute against the right tree. +4 tests (114 → 118). Closes §12 item 7 (Node + Go DoD types). Verified by Node smoke (herdr `wAK:p1`, 2026-08-02, `[judge:structured] detected project type: node → running: npm test --silent → PASS` on every iteration) and Go smoke (herdr `wAM:p1`, 2026-08-03, `[judge:structured] detected project type: go → running: go test ./... → PASS` on every iteration). |
+| 2026-08-03 | `4c395a4` (PR #4) | **Auto-detect `--deliverable-path` from prompt text** — closes §12 item 1C. New `alps-cli/src/detect.rs` module (stdlib only) parses the prompt for preposition keywords (`at`, `in`, `to`, `into`, `under`, `inside`, `build at`, etc.) and picks the most-likely deliverable path via outside-workdir > mention-count > shortest-path scoring. 3-way override: explicit `--deliverable-path` always wins, prompt-derived wins when `--deliverable-path` is empty and the prompt mentions a build path, falls back to `--workdir` otherwise. 14 unit tests. Verified end-to-end by Node smoke (herdr `wAP:p1`, 2026-08-03, 5/5 stories, 182s implement, Judge `claude-opus-4` ACCEPTED, fired without `--deliverable-path` flag). |
+| 2026-08-03 | `e23ec6f` (PR #4 merge) | **Tier 3 Vite + React full-stack verified** — first ALPS run to deliver a frontend SPA end-to-end. 8/8 user stories, `npm run build` exit 0, Vitest 3/3 passed, Playwright screenshot visually confirmed. Caveat: alps orchestrator's post-implement pipeline (Review + Judge) was SIGPIPE'd by the `tee | log` wrapper during heavy stdout (`npm install` + `npm run build` + Playwright invocation); deliverable correctness verified by direct disk invocation, but `receipts.json` was not written. To re-fire for a clean Judge verdict, drop `tee` (see §12 item 4 reference / alps skill Pitfall #28). No ALPS-side code changes needed — Node DoD path (PR #3) handled the Vite project without modification. |
 
 ### Verified end-to-end
 
 - **Happy path** — 7 successful smokes (smoke3, smoke4, smoke5, smoke6, smoke7, smoke8, smoke9) — all pass with Judge LLM verdict "pass" on the first attempt.
 - **Rust DoD path** — first Rust smoke (2026-07-27, herdr pane `wA6:p1`, 9 min wall clock, 1 attempt): 4/4 stories, 8/8 review assertions, 6 review findings (0 critical), `cargo build --quiet` exit 0, `cargo test --quiet` exit 0 (1 passed). Verified `DoDRunner.detect_project_type` finds `Cargo.toml` → `ProjectType::Rust` → `cargo test --quiet`. Workdir guard re-verified on this run.
+- **Node DoD path** — Tier 2.5 smoke (2026-08-02, herdr `wAK:p1`, ~52 min wall clock, 4 outer iterations): `[judge:structured] detected project type: node → running: npm test --silent → PASS` on every iteration. Direct `npm test`: 2 passed. Closes §12 item 7 half 1.
+- **Go DoD path** — Tier 2.5b smoke (2026-08-03, herdr `wAM:p1`, ~22 min wall clock, 3 outer iterations): `[judge:structured] detected project type: go → running: go test ./... → PASS` on every iteration. Direct `go test -v -count=1`: 3 passed. Closes §12 item 7 half 2.
+- **Tier 3 full-stack (Vite + React + TypeScript)** — 2026-08-03, herdr `wAN:p1`, 8/8 user stories, `npm run build` exit 0, Vitest 3/3 passed, Playwright screenshot visually confirmed at 1280x800. Caveat: post-implement SIGPIPE on `tee | log` (see §12 item 4 / Runtime Pitfall #28) — deliverable verified by direct disk invocation, but `receipts.json` was not written. To re-fire for a clean Judge verdict, drop `tee` from the wrapper script.
 - **Multi-iteration ralph** — smoke9 (wA5:p1, todo CLI with 7 stories) hit 5 ralph iterations, 4/7 stories passed, Judge correctly rejected for missing `test_todo.py` and stub commands, loop restarted with feedback. Second outer iteration made 5+ more iterations before smoke was manually killed (full completion would have taken 30+ min). Net: outer loop correctly handles partial progress and the fix for ralph max-iterations (3 unit tests) is the natural extension.
 - **Real reject-path → acceptance** — CRUD smoke (2026-07-30, foreground `terminal(background=true)` diagnostic, ~25 min wall clock, 1 outer-loop attempt at the task level but 4 outer iterations inside the loop's perspective): rejected 3 times for distinct real defects (missing runtime verification, missing artifact capture + Pydantic `ItemOut` violation, RFC-violating 204 body), accepted on 4th iteration with 6/6 ralph stories, 11/11 review assertions, 0 critical findings. **This is the first ALPS run ever to complete end-to-end via the reject path** — surfaces that the existing `drive_rejects_then_passes_appends_feedback_to_next_plan` unit test faithfully represents real judge behavior, not just test-scripted Judge stubs. Deliverable at `/tmp/alps-crud-demo/` (`pytest -q` → 4 passed; `from main import app` works; 4 routes registered for POST/GET-list/GET-one/DELETE). Reasoning captured in the per-task `progress.txt` traces the close-then-reopen cycle on each iteration.
 - **AGENTS.md propagation** — verified end-to-end; the task-level `AGENTS.md` accumulates patterns from each ralph iteration and is fed back to review/judge/next-plan.
@@ -53,6 +61,7 @@ what landed in `klampatech/alps` between the spec and now.
 
 - ~~**Plan agent JSON flakiness**~~ — **resolved by `6a414a8` and `894be6b`**. All three LLM agents (Plan, Review, Judge) now retry up to 3 total attempts on JSON parse failure. Net effect: intermittent flakiness becomes transparent recovery. If all 3 fail, the run dies with a `failed after 3 attempts: ...` error.
 - **Type-state attempt counter resets on `Rejected::reset()`** — the second iteration's plan shows `attempt=1`, not `2`. Not a bug per se (each `Planned` represents one attempt at a plan), but the type-state doesn't track global iteration. The `Rejected` struct carries `attempts: u32` but `reset()` doesn't pass it forward. Worth a small refactor if we want a global attempt counter on `Task<Done>`.
+- **Tier 3 SIGPIPE on heavy stdout (Runtime Pitfall #28)** — when the wrapper script's `tee | log` pipe consumes the alps orchestrator's stdout during heavy-output smokes (`npm install` + `npm run build` + Playwright invocation), `tee` can get SIGPIPE'd. The alps process exits cleanly, but `receipts.json` is never written and `.alps-last-done` is never touched. The deliverable's correctness is real (verified by direct disk invocation); only the Judge verdict is missing. **Mitigation:** drop `tee` from the wrapper script. The canonical smoke recipe uses `herdr pane run <pane_id> "..."` + `herdr wait output <pane> --match "ALPS — Done" --timeout N` — `tee` is decorative.
 
 ## 1. What is ALPS?
 
@@ -100,13 +109,12 @@ If the Judge **rejects**, the loop restarts at Plan with feedback appended to th
 
 ALPS is the **outer orchestrator**. Ralph is the **inner implement loop**. ALPS treats Ralph as a black-box subprocess:
 
-- ALPS writes `prd.json` and `prompt.md` into a Ralph working dir
-- ALPS invokes `ralph.sh` (or `codex --ralph`-style entry point)
-- Ralph runs its own loop: read PRD → pick story → implement → test → commit → loop
-- Ralph exits when it sees `COMPLETE` in `progress.txt` or hits max iterations
-- ALPS reads back `prd.json` (with `passes: true`) and `progress.txt` to produce `Implementation`
+- ALPS writes `prd.json` (a 1:1 mapping from `Plan.stories` to Ralph's `userStories` format) and `progress.txt` (with `## Codebase Patterns` header) into `tasks/<id>/implementation/ralph/<workdir>`.
+- ALPS spawns `ralph.sh --tool codex <max-iterations>` with stdin/stdout inherited. Ralph runs its own loop: read PRD → pick story → implement → test → commit → loop. Ralph exits 0 when `<promise>COMPLETE</promise>` lands in `.codex-last-message.txt` (the codex-specific completion extraction; commits `799067d`–`752c41a`).
+- ALPS reads back `prd.json` (stories now have `passes: true`), `progress.txt`, and `git log` for commits → typed `Implementation`. The `ImplementMetrics` (stories_passed, stories_total, iterations, elapsed_secs) are read from `.ralph-result.json` (persisted by Ralph after each invocation) and plumbed through to `Receipts`.
+- `read_artifacts` walks `tasks/<id>/implementation/ralph/` (or `--deliverable-path` if set) recursively to populate `Implementation.artifacts` for the LLM Judge. Skips `target/`, `node_modules/`, `.git/`, etc. via `SKIP_DIRS`.
 
-This is the same boundary Ralph's own loop uses for Claude Code / Amp. We don't reinvent Ralph.
+The inner-loop completion signal is **codex-specific** (`.codex-last-message.txt` containing the promise). When Ralph is later swapped to a different tool (claude, etc.), this extract/parsing must be re-implemented — it's the only alps-side knowledge of the inner tool. Ralph's nested git repo (`tasks/<id>/implementation/ralph/.git/`) is excluded from the parent workdir's `git add -A` via `<workdir>/.git/info/exclude` (commit `6ebaf92`, Runtime Pitfall #7).
 
 ## 3. Sequence Diagrams
 
@@ -223,6 +231,18 @@ pub struct Implementation {
     pub prd_path: PathBuf,
     pub commits: Vec<Commit>,
     pub artifacts: Vec<Artifact>,
+    /// Metrics captured from the Ralph run — iterations, elapsed time, story
+    /// completion. Plumbed through to `Receipts` so the user sees real numbers.
+    /// When the orchestrator hits a partial-progress state (ralph exits non-zero
+    /// at max-iterations), this is what surfaces back to the Judge.
+    pub metrics: ImplementMetrics,
+    /// Where the deliverable actually lives. Defaults to the ralph nested
+    /// workspace (`tasks/<id>/implementation/ralph/`). When the prompt specifies
+    /// a target path *outside* `--workdir` (e.g. "build at `/tmp/foo/`"), the
+    /// CLI sets this to that path via `--deliverable-path` (or auto-detect) so
+    /// `read_artifacts` and the Judge's `read_files` walk the right tree.
+    /// See §12 item 2 — closes the gap surfaced by the 2026-07-30 CRUD smoke v2.
+    pub deliverable_path: PathBuf,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -276,7 +296,10 @@ pub struct Assertion {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Judgment {
-    Pass(Receipts),
+    /// `Receipts` is the final-assembled output type and lives in `receipt.rs`
+    /// (not `domain.rs`) — it's not domain data carried through the loop, it's
+    /// the surface that Kyle sees + the durable JSON for downstream tooling.
+    Pass(crate::receipt::Receipts),
     Reject(Feedback),
 }
 
@@ -323,8 +346,15 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Every agent in the ALPS loop is `Agent<Input, Output, Error>`.
-/// Sealed: external crates cannot add new agent kinds.
+/// Every agent in the ALPS loop is a subtype of `Agent`. The trait is sealed
+/// (external crates cannot add new agent kinds) and uses associated types for
+/// `Input`, `Output`, and `Error`. Agents that take no input (e.g. Review reads
+/// implementation state from the workspace, Judge reads the Reviewed state)
+/// use `EmptyInput` as their `Input`.
+///
+/// The original spec draft had `Agent<Input, Output, Error>` as a generic
+/// struct — that was redesigned in the v0.1 implementation to use associated
+/// types for cleaner monomorphization.
 pub trait Agent: Send + Sync + sealed::Sealed {
     type Input: Serialize + for<'de> Deserialize<'de> + Send + Sync;
     type Output: Serialize + for<'de> Deserialize<'de> + Send + Sync;
@@ -334,11 +364,14 @@ pub trait Agent: Send + Sync + sealed::Sealed {
     async fn run(&self, input: Self::Input) -> Result<Self::Output, Self::Error>;
 }
 
-// Concrete agents (one per step)
-pub struct PlanAgent { /* Claude Code config */ }
-pub struct ImplementAgent { /* Ralph config */ }
-pub struct ReviewAgent { /* Claude Code config */ }
-pub struct JudgeAgent { /* Hermes config */ }
+/// Sentinel for agents that take no input (Review, Judge).
+pub struct EmptyInput;
+
+/// Concrete agents (one per step)
+pub struct PlanAgent { /* Claude Code config: model + JSON-output prompt */ }
+pub struct ImplementAgent { /* Ralph config: max_iterations, ralph.sh path */ }
+pub struct ReviewAgent { /* Claude Code config: model + adversarial prompt */ }
+pub struct JudgeAgent { /* Hybrid: StructuredJudge + HermesLlmJudge */ }
 
 impl sealed::Sealed for PlanAgent {}
 impl sealed::Sealed for ImplementAgent {}
@@ -352,64 +385,83 @@ impl Agent for PlanAgent {
     fn name(&self) -> &'static str { "plan" }
     async fn run(&self, input: Self::Input) -> Result<Self::Output, Self::Error> { /* ... */ }
 }
-// ... etc for ImplementAgent, ReviewAgent, JudgeAgent
+impl Agent for ImplementAgent {
+    type Input = Plan;
+    type Output = Implementation;
+    type Error = ImplementError;
+    fn name(&self) -> &'static str { "implement" }
+    async fn run(&self, input: Self::Input) -> Result<Self::Output, Self::Error> { /* ... */ }
+}
+impl Agent for ReviewAgent {
+    type Input = EmptyInput;
+    type Output = Review;
+    type Error = ReviewError;
+    fn name(&self) -> &'static str { "review" }
+    async fn run(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> { /* ... */ }
+}
+impl Agent for JudgeAgent {
+    type Input = EmptyInput;
+    type Output = Judgment;
+    type Error = JudgeError;
+    fn name(&self) -> &'static str { "judge" }
+    async fn run(&self, _input: Self::Input) -> Result<Self::Output, Self::Error> { /* ... */ }
+}
 ```
 
 ### 5.4 Type-state pattern — the heart of strict typing
 
 Each state is a **distinct struct**. Transitions consume `self` and return the next state. Missing transitions are **compile errors**.
 
+**Note on the prompt's location:** the original spec draft had `prompt: Prompt` inside each state struct (e.g. `Planned { prompt, plan, attempt }`). The v0.1 implementation moved `prompt` to `Task<S>` itself, because it doesn't change between states (except when `Rejected::reset()` appends feedback to it). This keeps the state structs minimal and lets `Task<Rejected>::reset()` produce a `Task<Idle>` with the feedback-augmented prompt.
+
 ```rust
+/// `prompt` lives on `Task<S>` itself, not in each state.
 pub struct Task<State> {
     pub id: TaskId,
+    pub prompt: Prompt,
     pub workdir: PathBuf,
     pub state: State,
     _phantom: PhantomData<State>,
 }
 
-/// Initial state. Has a prompt, nothing else.
-pub struct Idle {
-    pub prompt: Prompt,
-}
+/// Initial state. Only the prompt exists.
+pub struct Idle;
 
-/// Plan emitted.
+/// Plan has been emitted.
 pub struct Planned {
-    pub prompt: Prompt,
     pub plan: Plan,
     pub attempt: u32,
 }
 
-/// Implementation emitted by Ralph.
+/// Implementation has been emitted by Ralph.
 pub struct Implemented {
-    pub prompt: Prompt,
     pub plan: Plan,
     pub implementation: Implementation,
     pub attempt: u32,
 }
 
-/// Review emitted.
+/// Review has been emitted.
 pub struct Reviewed {
-    pub prompt: Prompt,
     pub plan: Plan,
     pub implementation: Implementation,
     pub review: Review,
     pub attempt: u32,
 }
 
-/// Judge accepted.
+/// Judge has accepted. Terminal.
 pub struct Done {
     pub receipts: Receipts,
     pub attempts: u32,
 }
 
-/// Judge rejected — must reset to Idle with feedback.
+/// Judge has rejected. Must reset to Idle.
 pub struct Rejected {
     pub feedback: Feedback,
     pub attempts: u32,
     pub history: Vec<Attempt>,
 }
 
-/// Catastrophic failure.
+/// Catastrophic failure. Terminal.
 pub struct Failed {
     pub reason: FailureReason,
     pub attempts: u32,
@@ -443,8 +495,9 @@ impl Task<Idle> {
     pub fn new(id: TaskId, workdir: PathBuf, prompt: Prompt) -> Self {
         Task {
             id,
+            prompt,
             workdir,
-            state: Idle { prompt },
+            state: Idle,
             _phantom: PhantomData,
         }
     }
@@ -452,12 +505,9 @@ impl Task<Idle> {
     pub fn plan(self, plan: Plan) -> Task<Planned> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
-            state: Planned {
-                prompt: self.state.prompt,
-                plan,
-                attempt: 1,
-            },
+            state: Planned { plan, attempt: 1 },
             _phantom: PhantomData,
         }
     }
@@ -465,6 +515,7 @@ impl Task<Idle> {
     pub fn fail(self, reason: FailureReason) -> Task<Failed> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
             state: Failed { reason, attempts: 0 },
             _phantom: PhantomData,
@@ -476,9 +527,9 @@ impl Task<Planned> {
     pub fn implement(self, implementation: Implementation) -> Task<Implemented> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
             state: Implemented {
-                prompt: self.state.prompt,
                 plan: self.state.plan,
                 implementation,
                 attempt: self.state.attempt,
@@ -490,8 +541,12 @@ impl Task<Planned> {
     pub fn fail(self, reason: FailureReason) -> Task<Failed> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
-            state: Failed { reason, attempts: self.state.attempt },
+            state: Failed {
+                reason,
+                attempts: self.state.attempt,
+            },
             _phantom: PhantomData,
         }
     }
@@ -501,9 +556,9 @@ impl Task<Implemented> {
     pub fn review(self, review: Review) -> Task<Reviewed> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
             state: Reviewed {
-                prompt: self.state.prompt,
                 plan: self.state.plan,
                 implementation: self.state.implementation,
                 review,
@@ -516,19 +571,25 @@ impl Task<Implemented> {
     pub fn fail(self, reason: FailureReason) -> Task<Failed> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
-            state: Failed { reason, attempts: self.state.attempt },
+            state: Failed {
+                reason,
+                attempts: self.state.attempt,
+            },
             _phantom: PhantomData,
         }
     }
 }
 
 impl Task<Reviewed> {
-    /// The judge. Returns Result — `Ok` on pass, `Err` on reject.
+    /// The judge. Returns `Ok` on pass, `Err` on reject.
     pub fn judge(self, judgment: Judgment) -> Result<Task<Done>, Task<Rejected>> {
+        use Judgment::*;
         match judgment {
-            Judgment::Pass(receipts) => Ok(Task {
+            Pass(receipts) => Ok(Task {
                 id: self.id,
+                prompt: self.prompt,
                 workdir: self.workdir,
                 state: Done {
                     receipts,
@@ -536,8 +597,9 @@ impl Task<Reviewed> {
                 },
                 _phantom: PhantomData,
             }),
-            Judgment::Reject(feedback) => Err(Task {
+            Reject(feedback) => Err(Task {
                 id: self.id,
+                prompt: self.prompt,
                 workdir: self.workdir,
                 state: Rejected {
                     feedback,
@@ -552,8 +614,12 @@ impl Task<Reviewed> {
     pub fn fail(self, reason: FailureReason) -> Task<Failed> {
         Task {
             id: self.id,
+            prompt: self.prompt,
             workdir: self.workdir,
-            state: Failed { reason, attempts: self.state.attempt },
+            state: Failed {
+                reason,
+                attempts: self.state.attempt,
+            },
             _phantom: PhantomData,
         }
     }
@@ -562,12 +628,18 @@ impl Task<Reviewed> {
 impl Task<Rejected> {
     /// The only way out of Rejected. Appends feedback to the prompt
     /// and returns to Idle. The next iteration starts a fresh attempt.
-    pub fn reset(self, history: Vec<Attempt>) -> Task<Idle> {
-        let prompt = Self::append_feedback(&self.state.prompt, &self.state.feedback, self.state.attempts);
+    pub fn reset(self, _history: Vec<Attempt>) -> Task<Idle> {
+        // History is recorded by persistence; not used in reset.
+        let new_prompt = Self::append_feedback(
+            &self.prompt,
+            &self.state.feedback,
+            self.state.attempts,
+        );
         Task {
             id: self.id,
+            prompt: new_prompt,
             workdir: self.workdir,
-            state: Idle { prompt },
+            state: Idle,
             _phantom: PhantomData,
         }
     }
@@ -637,47 +709,70 @@ alps/                              # Cargo workspace
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs                 # Re-exports
-│       ├── task.rs                # Type-state Task<S> + state structs
-│       ├── loop_.rs               # Outer loop driver (`loop` is a keyword)
-│       ├── plan.rs                # PlanAgent + PlanError
+│       ├── task.rs                # Type-state Task<S> + state structs + transitions
+│       ├── loop_.rs               # Outer loop driver — RECURSIVE, not loop{} (mod loop_ because `loop` is a Rust keyword)
+│       ├── plan.rs                # PlanAgent (real Claude Code invocation) + PlanError
 │       ├── implement.rs           # ImplementAgent (Ralph subprocess) + ImplementError
-│       ├── review.rs              # ReviewAgent + ReviewError
-│       ├── judge.rs               # JudgeAgent + JudgeError
-│       ├── receipt.rs             # Receipts, ImplementMetrics, ReviewSummary
-│       ├── persistence.rs         # JSON file I/O for task workspace
-│       ├── error.rs               # AlpsError
-│       └── domain.rs              # Plan, Review, Implementation, etc.
+│       ├── review.rs              # ReviewAgent (adversarial Claude with JSON schema) + ReviewError
+│       ├── judge.rs               # JudgeAgent (hybrid: DoDRunner + HermesLlmJudge) + JudgeError
+│       ├── agents_md.rs           # Task-level AGENTS.md read/write/append + extract_patterns
+│       ├── git_ops.rs             # commit_smart + ensure_ralph_excluded + create_branch
+│       ├── receipt.rs             # Receipts, ImplementMetrics, ReviewSummary (final-assembled output types — NOT in domain.rs)
+│       ├── persistence.rs         # Per-state Persistable impls + TaskWorkspace helpers
+│       ├── error.rs               # AlpsError taxonomy (thiserror)
+│       ├── agent.rs               # Sealed Agent trait + EmptyInput
+│       ├── workdir_guard.rs       # v0.4 sentinel debounce against auto-reinvoke
+│       └── domain.rs              # Plan, Review, Implementation, Judgment, etc. (newtypes + IDs)
 └── alps-cli/
     ├── Cargo.toml
     └── src/
-        └── main.rs                # CLI entry — `alps run "prompt"`
+        ├── main.rs                # CLI entry — `alps run "prompt" [--workdir] [--force] [--deliverable-path]`
+        └── detect.rs              # v0.7.1+3 auto-detect --deliverable-path from prompt text (stdlib only)
+├── scripts/                       # Vendored from snarktank/ralph
+│   ├── ralph.sh                   # Ralph loop runner (must be executable)
+│   └── CLAUDE.md                  # Ralph's Claude Code prompt
+└── tasks/                         # Per-task workspaces, git-committed per state
 ```
 
 ## 7. Per-Task File Structure
 
 Each task gets a directory under `tasks/`. Git is the main history — every artifact is committed.
 
+The actual file structure (as of v0.7.2, persisting via `persistence.rs`):
+
 ```
 tasks/<task-id>/
-├── prompt.md                      # Initial prompt
-├── prompt-history.md              # Prompt with feedback appended (rejection rounds)
-├── plan.json                      # Latest plan
-├── implementation/
-│   └── ralph/                     # Ralph's working dir (clone of target repo)
-│       ├── prd.json
-│       ├── progress.txt
-│       ├── CLAUDE.md              # if Claude Code
-│       └── commits.log
-├── review.json                    # Latest review findings
-├── judgment.json                  # Latest judgment
-├── receipts.json                  # Final receipts (only on Done)
-└── feedback.json                  # Last rejected feedback (only on Rejected)
+├── prompt.md                      # Initial prompt (canonical)
+├── plan.json                      # Latest plan (typed `Plan` from `domain.rs`)
+├── implementation.json            # Implementation artifact (v0.7+ — persists `Implementation` struct including `deliverable_path`)
+├── review.json                    # Latest review findings (typed `Review`)
+├── receipts.json                  # Final receipts (only on Done; `Receipts` from `receipt.rs`)
+├── feedback.json                  # Last rejected feedback (only on Rejected; appended to prompt on next attempt)
+├── AGENTS.md                      # Cross-agent memory — `## Codebase Patterns` from ralph → review/judge/next-plan
+└── implementation/
+    └── ralph/                     # Ralph's working dir (separate git repo, excluded from parent via `<workdir>/.git/info/exclude`)
+        ├── prd.json               # 1:1 mapping from Plan.stories → Ralph's userStories format
+        ├── progress.txt           # `## Codebase Patterns` header for orchestrator extraction
+        ├── .ralph-result.json     # ImplementMetrics (stories_passed, iterations, elapsed_secs)
+        ├── .codex-last-message.txt# Codex completion signal (`<promise>COMPLETE</promise>` extraction)
+        ├── CLAUDE.md              # Ralph's Claude Code prompt (vendored)
+        ├── ralph.sh               # Ralph's loop runner (vendored)
+        └── *.git/                 # Nested git repo, excluded from parent
 ```
+
+**Branch creation** — `git_ops::create_branch(dir, branch_name)` is idempotent (reuses an existing branch instead of erroring "already exists"). The CLI calls it at task start; on retry the same branch is reused.
+
+**Per-task state files** are tracked on the per-task branch `alps/<task-id>` but gitignored on `main` so they don't pollute the source tree.
+
+**Auto-commit** — `commit_smart` is the trailing commit at task end. It checks `git status --porcelain` first; if nothing changed, it's silent (not NothingToCommit noise). Only commits when the per-task state actually changed since the last iteration.
 
 ## 8. The Outer Loop
 
 ```rust
-// alps-core/src/loop_.rs — sketch
+// alps-core/src/loop_.rs — actual signature is RECURSIVE, not a loop { } block
+// (loop{} doesn't work with type-state: `task = task.method(...)` doesn't compile
+//  after the assignment, task is still typed as the original state. Recursive
+//  function calls with `let task = task.method(...)` shadowing work cleanly.)
 pub async fn drive(
     task: Task<Idle>,
     plan: &PlanAgent,
@@ -685,42 +780,35 @@ pub async fn drive(
     review: &ReviewAgent,
     judge: &JudgeAgent,
 ) -> Result<Task<Done>, AlpsError> {
-    let mut task = task;
+    let plan_input = task.prompt.clone();
+    let plan_out = plan.run(plan_input).await
+        .map_err(|e| AlpsError::PlanAgent(Box::new(e)))?;
+    let task = task.plan(plan_out);
+    persist(&task)?;
 
-    loop {
-        // Plan
-        let plan_input = task.state.prompt.clone();
-        let plan_out = plan.run(plan_input).await
-            .map_err(|e| AlpsError::PlanAgent(Box::new(e)))?;
-        task = task.plan(plan_out);
-        persist(&task)?;
+    let impl_input = task.state.plan.clone();
+    let impl_out = implement.run(impl_input).await
+        .map_err(|e| AlpsError::Implement(Box::new(e)))?;
+    let task = task.implement(impl_out);
+    persist(&task)?;
 
-        // Implement
-        let impl_input = task.state.plan.clone();
-        let impl_out = implement.run(impl_input).await
-            .map_err(|e| AlpsError::Implement(Box::new(e)))?;
-        task = task.implement(impl_out);
-        persist(&task)?;
+    let review_out = review.run(EmptyInput).await
+        .map_err(|e| AlpsError::ReviewAgent(Box::new(e)))?;
+    let task = task.review(review_out);
+    persist(&task)?;
 
-        // Review
-        let review_out = review.run(()).await
-            .map_err(|e| AlpsError::ReviewAgent(Box::new(e)))?;
-        task = task.review(review_out);
-        persist(&task)?;
-
-        // Judge
-        let judgment = judge.run(()).await
-            .map_err(|e| AlpsError::Judge(Box::new(e)))?;
-        match task.judge(judgment) {
-            Ok(done) => {
-                persist(&done)?;
-                return Ok(done);
-            }
-            Err(rejected) => {
-                persist(&rejected)?;
-                // append feedback to prompt, reset to Idle
-                task = rejected.reset(vec![]);
-            }
+    let judgment = judge.run(EmptyInput).await
+        .map_err(|e| AlpsError::Judge(Box::new(e)))?;
+    match task.judge(judgment) {
+        Ok(done) => {
+            persist(&done)?;
+            Ok(done)
+        }
+        Err(rejected) => {
+            persist(&rejected)?;
+            // append feedback to prompt, reset to Idle, recurse
+            let history = vec![]; // populated by persistence::record_attempt
+            drive(rejected.reset(history), plan, implement, review, judge).await
         }
     }
 }
@@ -752,8 +840,17 @@ pub async fn drive(
 - [ ] `MaxAttempts` and escalation policy
 - [x] ~~AGENTS.md / CLAUDE.md updates from implement step~~ (landed early in `f452ca3`)
 - [x] ~~Structured plan output (typed user stories, typed DoD)~~ (landed in `a36978f`)
-- [x] **Rust DoD path** — `DoDRunner` auto-detects Rust, runs `cargo test`. Code is there; never smoke-tested.
+- [x] **Rust DoD path** — verified end-to-end by Rust smoke (2026-07-27, herdr `wA6:p1`, `cargo test --quiet` exit 0).
+- [x] **Node DoD path** — verified end-to-end by Node smoke (2026-08-02, herdr `wAK:p1`, `npm test` exit 0).
+- [x] **Go DoD path** — verified end-to-end by Go smoke (2026-08-03, herdr `wAM:p1`, `go test -v -count=1` exit 0).
 - [x] **Plan retry-on-parse-fail** — landed in `6a414a8`. `PlanAgent::run` retries up to `max_retries=3` on `PlanError::Parse`. 5 deterministic tests cover the contract.
+- [x] **Review + Judge retry-on-parse-fail** — landed in `894be6b`. Same pattern; `JudgeError::Parse` variant added.
+- [x] **Multi-iteration ralph** — landed in `06d916d`. The 20-iteration safety net now routes through Judge (was a hard error before). 3 new integration tests with fake ralph.sh scripts.
+- [x] **Recursive artifact collection** — landed in `fd35ff5`. `read_artifacts` walks `ralph_dir` recursively (was non-recursive `std::fs::read_dir`), so subdirectory source trees land in `Implementation.artifacts`. +1 regression test.
+- [x] **--deliverable-path flag** — landed in PR #2 (2026-08-01, commit `e6fce8a`). Routes `read_artifacts`, the Judge's `read_files`, and the Review's `read_files` to walk the deliverable path. +4 tests (110 → 114).
+- [x] **Auto-detect --deliverable-path from prompt** — landed in PR #4 (2026-08-03, commit `4c395a4`). 14 unit tests in `alps-cli/src/detect.rs`. Operator no longer needs to pass the flag for the common "build at /tmp/foo" prompt shape.
+- [x] **CI (GitHub Actions)** — landed in PR #1 (2026-07-31, commit `6b27037`). `.github/workflows/ci.yaml` runs `cargo build --workspace --all-targets` + `cargo test --workspace --all-targets` + release build smoke on every push to main and every PR.
+- [x] **Real reject-path smoke** — verified end-to-end via the CRUD smoke (2026-07-30, foreground diagnostic). 4 outer iterations, 3 rejects (each catching a distinct real defect), 4th iteration accepted.
 
 ### Phase 3 — advanced
 
@@ -762,9 +859,20 @@ pub async fn drive(
 - [ ] Web UI for monitoring
 - [ ] Multi-model judge (judge ensemble)
 - [x] ~~Per-task branches in git (one branch per task)~~ (landed in `f452ca3`)
-- [ ] Cost ceiling per task (LLM Judge + Plan + Review add up fast on a "brute force" reject cycle)
-- [ ] CI (GitHub Actions on `klampatech/alps`)
-- [ ] Mock-agent test coverage for happy path + multi-iteration reject cycles
+- [x] ~~CI (GitHub Actions on `klampatech/alps`)~~ — landed in PR #1 (2026-07-31)
+- [ ] **Cost ceiling per task** — *DEFERRED 2026-08-03 per klampa*. Kyle runs ALPS off a $20/mo coding plan with 5-hour resets, so cost is not a barrier. Skip-list: do NOT propose this unprompted. Revisit only if multi-day ALPS-on-real-work becomes routine.
+- [ ] **Mock-agent happy-path test** — partial. `for_test` constructors landed in `731fbd3` and the reject-path test (`drive_rejects_then_passes_appends_feedback_to_next_plan`) is comprehensive. The symmetric happy-path test (`drive_passes_first_try`) is still missing — Tier 2 + smoke1 verified it in production but no unit test pins the contract. *Promoted to active — see §12 item 3.*
+
+### Phase 3.5 — Tier 4+ (post-orchestrator hardening)
+
+Verified end-to-end smokes that exercise the full pipeline (not unit tests):
+
+- [x] **Tier 1** — Node.js CRUD API (4 endpoints, stdlib sqlite3, pytest) — verified 2026-07-30
+- [x] **Tier 2** — Python FastAPI CRUD + vanilla-JS frontend (6 endpoints) — verified 2026-07-30
+- [x] **Tier 2.5** — Node.js module (`npm test`) — verified 2026-08-02, herdr `wAK:p1`
+- [x] **Tier 2.5b** — Go module (`go test`) — verified 2026-08-03, herdr `wAM:p1`
+- [x] **Tier 3** — Vite + React + TypeScript full-stack weather dashboard — verified 2026-08-03, herdr `wAN:p1` (Playwright screenshot delivered; deliverable verified, Judge verdict incomplete due to `tee | log` SIGPIPE)
+- [ ] **Tier 4** — TBD. Candidates: full-stack with real backend (Tier 3 + custom server), monorepo (Turborepo/Nx), mobile (React Native + Expo), infra (Terraform + Ansible), PDF/Excel deliverables. Each tier needs a `references/tierN-spec.md` draft and a `plan-then-execute` gate before firing.
 
 ## 10. Agent integrations
 
@@ -852,17 +960,18 @@ file is the durable artifact for downstream tooling.
 
 ## 12. Next work (prioritized)
 
-This is the live roadmap as of 2026-07-30. Items in **bold** are
+This is the live roadmap as of 2026-08-03. Items in **bold** are
 load-bearing for "ALPS works" claims. Items below the line are
 quality-of-life or scale concerns.
 
-1. ~~**Deliverable-outside-workdir gap, A (prompt-side)**~~ — *shipped 2026-07-30, commit `be4fd85`*. Recipe change in alps + herdr-iteration-workflow skills, with example prompt guard line. B (alps-side `--deliverable-path`) shipped 2026-08-01 (PR #2, commit `e6fce8a`). C (auto-detect) remains open but deferred until we see another real failure that the flag doesn't cover.
-2. ~~**Deliverable-outside-workdir gap, B (alps-side `--deliverable-path` flag)**~~ — *shipped 2026-08-01, **PR [#2](https://github.com/klampatech/alps/pull/2)** commit `34b10a9`*. `--deliverable-path <path>` (default = `--workdir`) routes `read_artifacts`, the Judge's `read_files`, and the Review's `read_files` to walk that path. `commit_smart_with_excludes` (new alongside `commit_smart`) appends the path to `<workdir>/.git/info/exclude` only when outside the workdir (idempotent, same mechanism as the v0.5 ralph nested-git exclude). `tasks/<id>/implementation.json` is now persisted at the Implemented state with the typed `Implementation` struct including `deliverable_path`, so the user has a durable record of which tree the Judge walked. `read_artifacts` defensively skips `tasks/` to prevent re-introducing ralph's nested git when the deliverable is a parent of the workdir. +4 tests (110 → 114). See §12 item 1A for the A half.
-3. **Mock-agent happy-path test** — we have the reject-path test; the happy path is still only smoke-tested. Adding `drive_passes_first_try` would close the symmetric gap. (Lower priority — Tier 2 + smoke1 already proved the happy-path in production.)
-4. **Spec §2.1 / §5.3 sync** — implementation has drifted further since the Tier 2 + Opus swap. Worth a top-to-bottom pass once the remaining §12 items 2 + 5 + 7 are done.
-5. **alps-source `AGENTS.md` / `CLAUDE.md`** — when alps runs against itself, the workdir-level AGENTS.md starts empty. Worth seeding the alps source repo with project conventions.
-6. **Cost ceiling** — "brute force" + LLM Judge (now Opus) = real money on a multi-reject cycle. The 3-reject CRUD smoke burned ~$1.50 of LLM Judge calls. Add a per-task USD cap that exits with `AlpsError` if exceeded.
-7. **More DoD project types** — currently Python + Rust. Add Node (`npm test`?), Go (`go test`?). 1-2 hours each. **Node support unlocks Tier 3 (full-stack with React/Vue/Svelte).**
+1. ~~**Deliverable-outside-workdir gap, A (prompt-side)**~~ — shipped 2026-07-30, commit `be4fd85`. Closed by the prompt-template guard line ("Write everything inside the workdir..."). Tier 2 CRUD smoke + Tier 2.5/2.5b smokes have all used this guard.
+2. ~~**Deliverable-outside-workdir gap, B (alps-side `--deliverable-path` flag)**~~ — shipped 2026-08-01, **PR [#2](https://github.com/klampatech/alps/pull/2)** commit `e6fce8a` (squashed at `a2ef8fd`). 4 new tests (110 → 114).
+3. **Mock-agent happy-path test** — *promoted to active 2026-08-03*. We have the reject-path test (`drive_rejects_then_passes_appends_feedback_to_next_plan`, comprehensive). The symmetric happy-path test (`drive_passes_first_try`) is still missing — Tier 2 + smoke1 verified it in production but no unit test pins the contract. Add `drive_passes_first_try` + a multi-iteration happy-path test (3 Plan→Implement→Review→Judge round-trips, all PASS). Mock-agent fixtures already exist (`for_test` constructors in each agent module); the work is wiring up the test driver.
+4. ~~**Spec §2.1 / §5.3 sync**~~ — *shipped 2026-08-03, this revision*. Major drift cleanup: §2.1 now reflects the `.codex-last-message.txt` completion signal + `read_artifacts` recursive walker; §5.2 reflects `Receipts` moving to `receipt.rs` + `Implementation` gaining `metrics` and `deliverable_path`; §5.3 reflects the `Agent` trait redesign (associated types + sealed + `EmptyInput`); §5.4 reflects `prompt` moving from state structs to `Task<S>` itself; §6 reflects the actual module layout (agents_md, workdir_guard, detect.rs); §7 reflects the actual per-task file structure (`implementation.json`, `feedback.json`, `AGENTS.md` at top level); §8 reflects the recursive `drive` driver; §9 marks Node/Go/Mock-test work appropriately; §12 (this section) reflects the closed items.
+5. **alps-source `AGENTS.md` / `CLAUDE.md`** — when alps runs against itself, the workdir-level AGENTS.md starts empty. Worth seeding the alps source repo with project conventions (build commands, test invocation, commit-hygiene rules, test isolation).
+6. **Cost ceiling** — *DEFERRED 2026-08-03 per klampa*. Kyle runs ALPS off a $20/mo coding plan with 5-hour resets, so cost is not a barrier. Skip-list: do NOT propose this unprompted. Revisit only if multi-day ALPS-on-real-work becomes routine.
+7. ~~**More DoD project types**~~ — *shipped 2026-08-02, **PR [#3](https://github.com/klampatech/alps/pull/3)** commit `0d840c1` (squashed at `bed70f9`)*. Node + Go wired into `DoDRunner.detect_project_type` + `test_command_for_each_type`. Verified by Node smoke (2026-08-02, herdr `wAK:p1`, 4 outer iterations, `[judge:structured] detected project type: node → running: npm test --silent → PASS` on every iteration) and Go smoke (2026-08-03, herdr `wAM:p1`, 3 outer iterations, `[judge:structured] detected project type: go → running: go test ./... → PASS` on every iteration). 4 new tests (114 → 118). **Tier 3 unblocked.**
+8. **Auto-detect `--deliverable-path` from prompt** — *shipped 2026-08-03, **PR [#4](https://github.com/klampatech/alps/pull/4)** commit `4c395a4` (squashed at `e23ec6f`)*. `alps-cli/src/detect.rs` (stdlib-only, 14 unit tests). 3-way override: explicit `--deliverable-path` always wins, prompt-derived wins when the flag is empty and the prompt mentions a build path, falls back to `--workdir` otherwise. Verified by Node smoke (herdr `wAP:p1`, 2026-08-03, 5/5 stories, 182s implement, Judge `claude-opus-4` ACCEPTED, fired without `--deliverable-path` flag).
 
 ### Recently completed (just shipped)
 
