@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::agent::{Agent, sealed};
+use crate::elog;
 use crate::domain::{Artifact, ArtifactKind, Commit, Implementation, Plan};
 use crate::receipt::ImplementMetrics;
 
@@ -334,7 +335,7 @@ venv/
         }
 
         // ── 8. Invoke Ralph ──
-        eprintln!(
+        elog!(
             "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}",
             self.config.tool, self.config.max_iterations, prd.user_stories.len()
         );
@@ -364,7 +365,7 @@ venv/
         // See SPEC.md §12 item #2: ralph exhausted-max-iterations routes
         // through the loop's reject path now.
         if !ralph_status.success() {
-            eprintln!(
+            elog!(
                 "[implement] ralph exited non-zero ({:?}); reading partial progress from prd.json",
                 ralph_status.code()
             );
@@ -395,7 +396,7 @@ venv/
         // show real numbers, not zeros.
         let ralph_result = read_ralph_result(&ralph_dir)?;
 
-        eprintln!(
+        elog!(
             "[implement] done: {}/{} stories passed, {} commits, {} artifacts, {} iterations, {}s elapsed (deliverable: {})",
             stories_passed, stories_total, commits.len(), artifacts.len(),
             ralph_result.iterations, ralph_result.elapsed_secs,

@@ -31,6 +31,7 @@ use alps_core::plan::PlanAgent;
 use alps_core::receipt::Receipts;
 use alps_core::review::ReviewAgent;
 use alps_core::task::{Done, Task};
+use alps_core::elog;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
@@ -92,11 +93,11 @@ async fn main() -> Result<()> {
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
-            eprintln!("alps list: not yet implemented");
+            elog!("alps list: not yet implemented");
             std::process::exit(1);
         }
         Command::Show { task_id } => {
-            eprintln!("alps show {}: not yet implemented", task_id);
+            elog!("alps show {}: not yet implemented", task_id);
             std::process::exit(1);
         }
     }
@@ -131,12 +132,12 @@ async fn run_task(
         // ralph_dir) is the right behavior here.
         match detect::detect(&prompt, &workdir) {
             Some(detected) => {
-                eprintln!("[detect] auto-detected deliverable-path: {}", detected.display());
+                elog!("[detect] auto-detected deliverable-path: {}", detected.display());
                 detected
             }
             None => {
                 let ralph_default = workdir.join("tasks").join(task_id.as_str()).join("implementation").join("ralph");
-                eprintln!("[detect] no viable prompt-derived path; using ralph nested git: {}", ralph_default.display());
+                elog!("[detect] no viable prompt-derived path; using ralph nested git: {}", ralph_default.display());
                 ralph_default
             }
         }
@@ -165,20 +166,20 @@ async fn run_task(
             threshold_secs,
         }) => {
             if !force {
-                eprintln!(
+                elog!(
                     "error: recent completion in workdir — task {} completed {}s ago (threshold {}s).",
                     prev, seconds_ago, threshold_secs
                 );
-                eprintln!(
+                elog!(
                     "       wrapping agent (Claude TUI / shell) may have re-invoked alps."
                 );
-                eprintln!(
+                elog!(
                     "       wait a few seconds, or pass --force to bypass this guard."
                 );
                 std::process::exit(2);
             }
             // --force: warn but proceed
-            eprintln!(
+            elog!(
                 "warning: bypassing workdir guard (task {} completed {}s ago)",
                 prev, seconds_ago
             );
@@ -186,7 +187,7 @@ async fn run_task(
         Err(e) => {
             // Other errors (malformed sentinel, IO) — warn but proceed.
             // A malformed sentinel shouldn't block legitimate runs.
-            eprintln!("warning: workdir guard check failed: {}", e);
+            elog!("warning: workdir guard check failed: {}", e);
         }
     }
 
@@ -199,7 +200,7 @@ async fn run_task(
     // Judge will walk, especially when --deliverable-path differs from
     // --workdir. See SPEC §12 item 2.
     if deliverable_path != workdir {
-        eprintln!(
+        elog!(
             "[alps] deliverable path: {} (workdir: {})",
             deliverable_path.display(),
             workdir.display()
@@ -211,14 +212,14 @@ async fn run_task(
     // what alps did for that run, then merge to main or discard.
     let branch = format!("alps/{}", task_id.as_str());
     match create_branch(&workdir, &branch) {
-        Ok(()) => eprintln!("[alps] on branch: {}", branch),
+        Ok(()) => elog!("[alps] on branch: {}", branch),
         Err(GitOpsError::Git { op, msg }) => {
-            eprintln!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
-            eprintln!("warning: continuing on current branch (no per-task isolation)");
+            elog!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
+            elog!("warning: continuing on current branch (no per-task isolation)");
         }
         Err(e) => {
-            eprintln!("warning: per-task branch failed: {}", e);
-            eprintln!("warning: continuing on current branch (no per-task isolation)");
+            elog!("warning: per-task branch failed: {}", e);
+            elog!("warning: continuing on current branch (no per-task isolation)");
         }
     }
 
@@ -276,16 +277,16 @@ async fn run_task(
             ) {
                 Ok(CommitOutcome::NothingToCommit) => {} // silent — expected
                 Ok(CommitOutcome::Committed) => {
-                    eprintln!("[done] auto-committed final state");
+                    elog!("[done] auto-committed final state");
                 }
                 Ok(CommitOutcome::CommitFailed(msg)) => {
-                    eprintln!("warning: git commit failed: {}", msg);
+                    elog!("warning: git commit failed: {}", msg);
                 }
                 Err(GitOpsError::Git { op, msg }) => {
-                    eprintln!("warning: git {} error: {}", op, msg);
+                    elog!("warning: git {} error: {}", op, msg);
                 }
                 Err(e) => {
-                    eprintln!("warning: auto-commit skipped: {}", e);
+                    elog!("warning: auto-commit skipped: {}", e);
                 }
             }
 
@@ -300,14 +301,14 @@ async fn run_task(
             if let Err(e) =
                 alps_core::workdir_guard::mark_complete(&workdir, task_id.as_str())
             {
-                eprintln!("warning: failed to mark workdir complete: {}", e);
+                elog!("warning: failed to mark workdir complete: {}", e);
             }
 
             Ok(())
         }
         Err(e) => {
             error!(target: "alps.cli", error = %e, "task failed");
-            eprintln!("error: {}", e);
+            elog!("error: {}", e);
             std::process::exit(1);
         }
     }
