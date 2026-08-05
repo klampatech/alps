@@ -209,18 +209,30 @@ async fn run_task(
     // Create per-task branch in the workdir so receipts + plan + feedback are
     // tracked in git history. The user can review `alps/<task-id>` to see
     // what alps did for that run, then merge to main or discard.
+    //
+    // If --workdir is not inside a git repo (e.g. `/tmp/foo` for an
+    // ephemeral smoke), skip the branch creation silently rather than
+    // warning. Tier 4 smokes burn through /tmp/alps-tier4-notes-workdir
+    // per-run and don't need per-task branch isolation; the orchestrator's
+    // own git init (in implement.rs:run_git) creates a repo inside
+    // tasks/<id>/implementation/ralph/ where ralph's commits live.
     let branch = format!("alps/{}", task_id.as_str());
-    match create_branch(&workdir, &branch) {
-        Ok(()) => eprintln!("[alps] on branch: {}", branch),
-        Err(GitOpsError::Git { op, msg }) => {
-            eprintln!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
-            eprintln!("warning: continuing on current branch (no per-task isolation)");
-        }
-        Err(e) => {
-            eprintln!("warning: per-task branch failed: {}", e);
-            eprintln!("warning: continuing on current branch (no per-task isolation)");
+    if is_inside_git_repo(&workdir) {
+        match create_branch(&workdir, &branch) {
+            Ok(()) => eprintln!("[alps] on branch: {}", branch),
+            Err(GitOpsError::Git { op, msg }) => {
+                eprintln!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
+                eprintln!("warning: continuing on current branch (no per-task isolation)");
+            }
+            Err(e) => {
+                eprintln!("warning: per-task branch failed: {}", e);
+                eprintln!("warning: continuing on current branch (no per-task isolation)");
+            }
         }
     }
+    // else: --workdir is not a git repo (e.g. /tmp ephemeral smoke).
+    // Per-task branch isolation is intentionally unavailable here; the
+    // orchestrator's own git init covers ralph's commits. Silent skip.
 
     let task = Task::<alps_core::task::Idle>::new(
         task_id.clone(),
@@ -335,4 +347,54 @@ fn print_markdown(task: &Task<Done>) {
     println!("- **Judge model:** {}", r.judge_model);
     println!();
     println!("Receipts written to `tasks/{}/receipts.json`", task.id.as_str());
+}
+
+/// Check whether `dir` is inside a git work tree. Used to gate the
+/// per-task branch creation in `run_task` — when `--workdir` points at
+/// an ephemeral directory like `/tmp/alps-tier4-notes-workdir`, there
+/// is no parent repo to branch from, and the warning that the CLI used
+/// to emit (`warning: per-task branch 'alps/...' failed ...`) was
+/// noise. The orchestrator's own `git init` (in
+/// `implement.rs::run_git`) covers ralph's commits inside the task
+/// dir, so per-task branch isolation is genuinely not needed there.
+fn is_inside_git_repo(dir: &std::path::Path) -> bool {
+    std::process::Command::new("git")
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_inside_git_repo;
+
+    #[test]
+    fn is_inside_git_repo_returns_true_for_alps_repo() {
+        // The alps repo itself is a git work tree (we run these tests
+        // from its root). Sanity-check the helper from a known-good dir.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(
+            is_inside_git_repo(&cwd),
+            "expected cwd ({}) to be inside a git work tree",
+            cwd.display()
+        );
+    }
+
+    #[test]
+    fn is_inside_git_repo_returns_false_for_ephemeral_tmp_dir() {
+        // /tmp is intentionally not a git repo on this host. If this
+        // ever fails (e.g. someone ran `git init` in /tmp), the
+        // per-task branch creation will start succeeding for /tmp/
+        // workdirs and create orphan branches — worth noticing.
+        let tmp = std::env::temp_dir();
+        // Sanity: temp dir exists and is writable.
+        assert!(tmp.is_dir(), "temp_dir should be a directory");
+        assert!(
+            !is_inside_git_repo(&tmp),
+            "expected {} to NOT be inside a git work tree (the CLI's silent-skip behavior depends on this)",
+            tmp.display()
+        );
+    }
 }
