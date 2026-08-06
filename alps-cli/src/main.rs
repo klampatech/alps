@@ -71,6 +71,28 @@ enum Command {
         /// See SPEC §12 item 2 / Runtime Pitfall #16.
         #[arg(long, default_value = "")]
         deliverable_path: String,
+
+        /// Optional path to a dedicated orchestrator-telemetry log file.
+        ///
+        /// When set, the orchestrator's `elog!` writes (e.g. `[plan] running`,
+        /// `[implement] running`, `[done] accepted`) are also written to this
+        /// file with `O_APPEND` semantics. This protects the orchestrator's
+        /// stderr output from being overwritten by other writers that open the
+        /// same file with `O_WRONLY` (notably `tee /dev/stderr` in ralph.sh,
+        /// which would otherwise clobber the orchestrator's earlier lines
+        /// starting at byte 0).
+        ///
+        /// Typical wrapper pattern: point both the wrapper's `2> file` redirect
+        /// (catches codex's stderr via `tee /dev/stderr`) and `--telemetry-log`
+        /// (catches the orchestrator's elog! writes) at the same path. Both
+        /// streams land in the file, and the O_APPEND flag prevents
+        /// cross-writer overwrites.
+        ///
+        /// If unset, telemetry goes only to stderr (FD 2), which works for
+        /// TTY/pipe captures but loses data when other processes open the
+        /// redirected file without O_APPEND.
+        #[arg(long, default_value = "")]
+        telemetry_log: String,
     },
 
     /// List tasks in the current workspace.
@@ -89,7 +111,19 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir, force, deliverable_path } => {
+        Command::Run { prompt, workdir, force, deliverable_path, telemetry_log } => {
+            // Export the telemetry-log path as an env var so the `elog!` macro
+            // (in alps-core/src/telemetry.rs) picks it up via `ALPS_TELEMETRY_LOG`.
+            // The macro opens the file with O_APPEND in a OnceLock-cached handle,
+            // so subsequent `elog!` calls in any module — including the loop
+            // driver and child agent code — write to the same file with atomic
+            // append semantics. This protects the orchestrator's stderr from
+            // being clobbered by `tee /dev/stderr` (which opens the same file
+            // with O_WRONLY without O_APPEND and would otherwise overwrite the
+            // orchestrator's earlier writes from byte 0).
+            if !telemetry_log.is_empty() {
+                std::env::set_var("ALPS_TELEMETRY_LOG", &telemetry_log);
+            }
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
