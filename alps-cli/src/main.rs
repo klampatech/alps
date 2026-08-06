@@ -107,6 +107,46 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a panic hook that writes panic info to a side file. The default
+    // panic hook writes to stderr — fine for interactive use, but a smoke-test
+    // wrapper's `2> file` redirect means the panic info is mixed with codex
+    // output. A side file is also preserved even if the main log is truncated
+    // or rotated. Set ALPS_PANIC_LOG=<path> in the wrapper to enable.
+    //
+    // This is the smoke #7 instrumentation (2026-08-06): the alps orchestrator
+    // dies after ralph.sh returns (last elog! = "[implement] invoking Ralph",
+    // .ralph-result.json written, but no "[implement] done" ever lands). With
+    // the panic hook, any Rust panic in the post-ralph code path leaves a
+    // backtrace + message in this file. If the file is empty, the orchestrator
+    // was killed by a signal (not a panic).
+    if let Ok(panic_log) = std::env::var("ALPS_PANIC_LOG") {
+        let panic_log = std::path::PathBuf::from(panic_log);
+        // Make sure parent dir exists
+        if let Some(parent) = panic_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let panic_log_for_hook = panic_log.clone();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            // Write the panic message + backtrace to the side file. We can't
+            // easily format the panic_info here, so write it raw and let the
+            // operator inspect it with `strings` or similar.
+            let bt = std::backtrace::Backtrace::force_capture();
+            let payload = format!(
+                "[alps-panic] {} at {}\n[alps-backtrace]\n{}\n",
+                panic_info,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                bt
+            );
+            let _ = std::fs::write(&panic_log_for_hook, &payload);
+            // Also try stderr as a fallback so operators not setting up
+            // ALPS_PANIC_LOG still see something.
+            eprintln!("[alps-panic] {}", panic_info);
+        }));
+    }
+
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 

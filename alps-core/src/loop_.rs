@@ -74,10 +74,14 @@ fn run_iteration<'a>(
 
         // ── Implement ──
         elog!("[implement] running");
+        eprintln!("[alps-diag] run_iteration: calling implement.run");
         let impl_out = implement.run(task.state.plan.clone()).await
             .map_err(|e| AlpsError::Implement(Box::new(e)))?;
+        eprintln!("[alps-diag] run_iteration: implement.run returned, impl_out.metrics={:?}", impl_out.metrics);
         let task = task.implement(impl_out);
+        eprintln!("[alps-diag] run_iteration: task.implement done, calling persist_task");
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
+        eprintln!("[alps-diag] run_iteration: persist_task done");
 
         // ── Implement-completion guard (SPEC §12 item 9) ──
         // The orchestrator MUST NOT trust Ralph's `.ralph-result.json`
