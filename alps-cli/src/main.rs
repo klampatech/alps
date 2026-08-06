@@ -36,6 +36,137 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
+/// Install SIGTERM / SIGINT / SIGHUP handlers that write a marker + backtrace
+/// to `$ALPS_SIGTERM_LOG` (default `/tmp/alps-sigterm.log`) BEFORE emulating
+/// the default disposition. This is the diagnostic unlock for §12 item 9:
+/// smoke #10 showed the orchestrator dies mid-`implement.run` with no panic
+/// and no core dump — most likely external SIGTERM, but the source was not
+/// visible. The handler captures (a) which signal arrived, (b) the exact
+/// instant, (c) a backtrace of the current async task, so we can correlate
+/// with `strace -f -e signal=all` to identify the sender PID.
+///
+/// We use `signal_hook::low_level` (raw `register`) rather than the high-
+/// level iterator because we want to log on EACH signal, even if multiple
+/// arrive before the runtime yields. Tokio's signal driver is NOT used —
+/// it would defer handling until a future is `.await`ed, which is too late
+/// if the orchestrator is mid-`process::exit` cleanup.
+///
+/// Set `ALPS_SIGTERM_LOG=<path>` to override the side-file path. If unset,
+/// signals are still handled (default disposition: terminate) but no log
+/// file is written.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::low_level;
+
+    let sig_log_path = std::env::var("ALPS_SIGTERM_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/alps-sigterm.log"));
+
+    // Ensure parent dir exists (e.g. /tmp/alps-tier4-smoke-11/).
+    if let Some(parent) = sig_log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Async-signal-safe stderr write. We avoid `libc::write` linkage
+    // by inlining a `nix`-free wrapper — POSIX guarantees `write(2)` is
+    // async-signal-safe.
+    //
+    // SAFETY: `write(2)` on FD 2 (stderr) is async-signal-safe per POSIX.1-2017
+    // §2.4.3. The pointer arithmetic only dereferences bytes from the same
+    // `&str` slice that was passed in, so it cannot escape the caller's
+    // lifetime even if the caller goes out of scope mid-signal (the kernel
+    // copies to its own buffer for queued signals; non-queued signals just
+    // race and either succeed or fail).
+    unsafe fn libc_write_stderr(s: &str) {
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+        }
+        let fd = 2;
+        let bytes = s.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            let n = write(fd, bytes.as_ptr().add(written), bytes.len() - written);
+            if n <= 0 {
+                break;
+            }
+            written += n as usize;
+        }
+    }
+
+    // Write the marker for one signal arrival and re-raise with the default
+    // disposition. Each signal gets its OWN closure (signal-hook 0.3 dropped
+    // the `extern "C" fn(i32)` callback API in favor of `Fn()` closures that
+    // don't receive the signal number — the trade-off is we register three
+    // identical-but-tagged handlers instead of one dispatching handler).
+    fn make_handler(sig_name: &'static str) -> impl Fn() + Send + Sync + 'static {
+        move || {
+            let payload = format!(
+                "[alps-signal] received {} at unix_ts={}\n[alps-signal-backtrace]\n{:?}\n",
+                sig_name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                std::backtrace::Backtrace::force_capture(),
+            );
+            // Resolve target at signal time so a wrapper that sets the env
+            // var AFTER process start still captures. Fall back to default.
+            let target = std::env::var("ALPS_SIGTERM_LOG")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/tmp/alps-sigterm.log".to_string());
+            let _ = std::fs::write(&target, &payload);
+            // SAFETY: see libc_write_stderr doc-comment.
+            unsafe {
+                libc_write_stderr(&payload);
+            }
+            // Re-raise with the default disposition so the process actually
+            // terminates (and strace sees the canonical exit). Without this,
+            // we'd eat the signal and the orchestrator would limp on.
+            let sig_id = match sig_name {
+                "SIGTERM" => SIGTERM,
+                "SIGINT" => SIGINT,
+                "SIGHUP" => SIGHUP,
+                _ => SIGTERM,
+            };
+            low_level::emulate_default_handler(sig_id).ok();
+        }
+    }
+
+    // Register one handler per signal we care about. A failure to register
+    // is non-fatal — log to stderr and continue. The orchestrator will
+    // still function, just without signal diagnostics.
+    let handlers: [(i32, Box<dyn Fn() + Send + Sync>); 3] = [
+        (SIGTERM, Box::new(make_handler("SIGTERM"))),
+        (SIGINT, Box::new(make_handler("SIGINT"))),
+        (SIGHUP, Box::new(make_handler("SIGHUP"))),
+    ];
+    for (sig, handler) in handlers {
+        if let Err(e) = unsafe { low_level::register(sig, handler) } {
+            eprintln!("[alps-diag] failed to register signal handler for {}: {}", sig, e);
+        }
+    }
+    // Also write a one-time "handlers installed" line so the post-mortem
+    // can confirm the diagnostic was active during the run (vs. the binary
+    // being a pre-handler version).
+    let install_marker = format!(
+        "[alps-signal] handlers installed at unix_ts={} for SIGTERM/SIGINT/SIGHUP\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let _ = std::fs::write(&sig_log_path, install_marker);
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {
+    // No-op on non-Unix. The smoke harness is Linux-only anyway.
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "alps", version, about = "Agentic Loop Programming System")]
 struct Args {
@@ -107,6 +238,16 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install SIGTERM/SIGINT/SIGHUP handlers BEFORE anything else (panic hook,
+    // tracing, even args parsing). See §12 item 9 (2026-08-06): the orchestrator
+    // dies mid-`implement.run` with no panic and no core dump — most likely an
+    // external SIGTERM. The handlers write a marker + backtrace to
+    // $ALPS_SIGTERM_LOG (default /tmp/alps-sigterm.log) and re-raise with the
+    // default disposition so the process still terminates. Pair with
+    // `strace -f -e signal=all -p <pid>` in the smoke wrapper to identify the
+    // sender.
+    install_signal_handlers();
+
     // Install a panic hook that writes panic info to a side file. The default
     // panic hook writes to stderr — fine for interactive use, but a smoke-test
     // wrapper's `2> file` redirect means the panic info is mixed with codex
