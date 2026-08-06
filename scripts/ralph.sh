@@ -246,7 +246,10 @@ for i in $(seq 1 $MAX_ITERATIONS); do
         # False positive: codex mentioned the string in prose but prd
         # disagrees. Continue iterating; the next codex invocation will
         # pick up the remaining stories.
-        local remaining
+        #
+        # Avoid `local` here — this block is inside a for loop, not a
+        # function, so `local` errors with "can only be used in a function".
+        # The var name is unique enough not to collide.
         remaining=$(remaining_stories "$PRD_FILE")
         echo ""
         echo "codex mentioned <promise>COMPLETE> in prose but $remaining stories still failing in prd.json. Continuing iteration."
@@ -261,7 +264,6 @@ for i in $(seq 1 $MAX_ITERATIONS); do
       write_ralph_result
       exit 0
     else
-      local remaining
       remaining=$(remaining_stories "$PRD_FILE")
       echo ""
       echo "tool mentioned <promise>COMPLETE> in prose but $remaining stories still failing in prd.json. Continuing iteration."
