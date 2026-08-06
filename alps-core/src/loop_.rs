@@ -24,6 +24,7 @@ use crate::plan::PlanAgent;
 use crate::review::{ReviewAgent, ReviewContext};
 use crate::task::*;
 use crate::{agents_md, domain::Prompt};
+use crate::elog;
 
 /// Drive the outer loop until Judge passes.
 ///
@@ -62,7 +63,7 @@ fn run_iteration<'a>(
             )))?;
 
         // ── Plan ──
-        eprintln!("[plan] running");
+        elog!("[plan] running");
         // Wrap the prompt with the AGENTS.md content so plan-on-retry knows
         // what the implementer and reviewer already discovered.
         let plan_prompt = wrap_prompt_with_agents_md(&task.prompt, &agents_md_content);
@@ -72,11 +73,15 @@ fn run_iteration<'a>(
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
 
         // ── Implement ──
-        eprintln!("[implement] running");
+        elog!("[implement] running");
+        eprintln!("[alps-diag] run_iteration: calling implement.run");
         let impl_out = implement.run(task.state.plan.clone()).await
             .map_err(|e| AlpsError::Implement(Box::new(e)))?;
+        eprintln!("[alps-diag] run_iteration: implement.run returned, impl_out.metrics={:?}", impl_out.metrics);
         let task = task.implement(impl_out);
+        eprintln!("[alps-diag] run_iteration: task.implement done, calling persist_task");
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
+        eprintln!("[alps-diag] run_iteration: persist_task done");
 
         // ── Implement-completion guard (SPEC §12 item 9) ──
         // The orchestrator MUST NOT trust Ralph's `.ralph-result.json`
@@ -120,7 +125,7 @@ fn run_iteration<'a>(
             )))?;
 
         // ── Review ──
-        eprintln!("[review] running");
+        elog!("[review] running");
         let review_ctx = ReviewContext {
             plan: task.state.plan.clone(),
             implementation: task.state.implementation.clone(),
@@ -132,7 +137,7 @@ fn run_iteration<'a>(
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
 
         // ── Judge ──
-        eprintln!("[judge] running");
+        elog!("[judge] running");
         let ctx = JudgeContext {
             task_id: task.id.clone(),
             plan: task.state.plan.clone(),
@@ -146,13 +151,13 @@ fn run_iteration<'a>(
         match task.judge(judgment) {
             Ok(done) => {
                 persist_task(&done, workspace).map_err(AlpsError::Persistence)?;
-                eprintln!("[done] accepted");
+                elog!("[done] accepted");
                 Ok(done)
             }
             Err(rejected) => {
                 persist_task(&rejected, workspace).map_err(AlpsError::Persistence)?;
                 let reason = rejected.state.feedback.reason.clone();
-                eprintln!("[rejected] {} — restarting with feedback", reason);
+                elog!("[rejected] {} — restarting with feedback", reason);
                 let next = rejected.reset(vec![]);
                 run_iteration(next, plan, implement, review, judge, workspace).await
             }

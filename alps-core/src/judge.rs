@@ -27,6 +27,7 @@ use crate::agent::{Agent, sealed};
 use crate::domain::{
     Assertion, Feedback, Finding, Implementation, Judgment, Plan, Review, Severity, TaskId,
 };
+use crate::elog;
 use crate::receipt::{ImplementMetrics, Receipts, ReviewSummary};
 
 #[derive(Debug, Error)]
@@ -268,7 +269,7 @@ impl LlmJudge for HermesLlmJudge {
             match self.judge_once(ctx).await {
                 Ok(j) => return Ok(j),
                 Err(JudgeError::Parse(msg)) => {
-                    eprintln!(
+                    elog!(
                         "[judge] parse failed (attempt {}/{}): {}",
                         attempt, max_attempts, msg
                     );
@@ -820,23 +821,23 @@ impl StructuredJudge for DoDRunner {
         };
 
         let project_type = detect_project_type(detect_root);
-        eprintln!("[judge:structured] detected project type: {}", project_type);
+        elog!("[judge:structured] detected project type: {}", project_type);
 
         if matches!(project_type, ProjectType::Unknown) {
-            eprintln!("[judge:structured] no project type detected, skipping DoD checks");
+            elog!("[judge:structured] no project type detected, skipping DoD checks");
             return Ok(StructuredResult { all_pass: true, failed: vec![] });
         }
 
         let (cmd, args) = test_command_for(&project_type);
-        eprintln!("[judge:structured] running: {} {}", cmd, args.join(" "));
+        elog!("[judge:structured] running: {} {}", cmd, args.join(" "));
 
         let result = run_cmd_with_timeout(detect_root, cmd, &args, self.config.timeout_secs).await?;
 
         if result.success {
-            eprintln!("[judge:structured] PASS");
+            elog!("[judge:structured] PASS");
             Ok(StructuredResult { all_pass: true, failed: vec![] })
         } else {
-            eprintln!(
+            elog!(
                 "[judge:structured] FAIL (exit {:?})",
                 result.exit_code
             );

@@ -20,6 +20,7 @@ use crate::agent::{Agent, sealed};
 use crate::domain::{
     ArtifactKind, Assertion, Finding, Implementation, Plan, Review, Severity,
 };
+use crate::elog;
 
 #[derive(Debug, Error)]
 pub enum ReviewError {
@@ -149,7 +150,7 @@ impl Agent for ReviewAgent {
             match self.run_once(ctx.clone()).await {
                 Ok(review) => return Ok(review),
                 Err(ReviewError::Parse(msg)) => {
-                    eprintln!(
+                    elog!(
                         "[review] parse failed (attempt {}/{}): {}",
                         attempt, max_attempts, msg
                     );

@@ -19,6 +19,7 @@ use thiserror::Error;
 use tokio::process::Command;
 
 use crate::agent::{Agent, sealed};
+use crate::elog;
 use crate::domain::{Artifact, ArtifactKind, Commit, Implementation, Plan};
 use crate::receipt::ImplementMetrics;
 
@@ -334,7 +335,7 @@ venv/
         }
 
         // ── 8. Invoke Ralph ──
-        eprintln!(
+        elog!(
             "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}",
             self.config.tool, self.config.max_iterations, prd.user_stories.len()
         );
@@ -363,14 +364,23 @@ venv/
         //
         // See SPEC.md §12 item #2: ralph exhausted-max-iterations routes
         // through the loop's reject path now.
+        //
+        // Smoke #7 instrumentation (2026-08-06): the orchestrator was
+        // observed dying AFTER ralph returns (no [implement] done, no
+        // [review] running, no [done] accepted) but BEFORE this point.
+        // The alps process disappears with SIGTERM. To diagnose, we add
+        // explicit eprintln! lines at every step of the post-ralph path.
+        // If alps dies silently, we'll see exactly which step it died on.
+        eprintln!("[alps-diag] ralph returned: status={:?}", ralph_status);
         if !ralph_status.success() {
-            eprintln!(
+            elog!(
                 "[implement] ralph exited non-zero ({:?}); reading partial progress from prd.json",
                 ralph_status.code()
             );
         }
 
         // ── 9. Read back results ──
+        eprintln!("[alps-diag] reading prd.json from {:?}", ralph_dir);
         let prd_text = std::fs::read_to_string(ralph_dir.join("prd.json")).map_err(|e| {
             ImplementError::Ralph {
                 op: "read prd.json after ralph".to_string(),
@@ -381,11 +391,18 @@ venv/
                 ),
             }
         })?;
+        eprintln!("[alps-diag] prd.json read: {} bytes", prd_text.len());
         let prd_after: RalphPrd = serde_json::from_str(&prd_text)
             .map_err(|e| ImplementError::PrdParse(format!("{}: {}", e, prd_text.chars().take(500).collect::<String>())))?;
+        eprintln!("[alps-diag] prd.json parsed: {} stories", prd_after.user_stories.len());
 
+        eprintln!("[alps-diag] reading commits from ralph_dir");
         let commits = read_commits(&ralph_dir)?;
+        eprintln!("[alps-diag] commits: {}", commits.len());
+
+        eprintln!("[alps-diag] reading artifacts from {:?}", deliverable_path);
         let artifacts = read_artifacts(&deliverable_path)?;
+        eprintln!("[alps-diag] artifacts: {}", artifacts.len());
 
         // Count stories that Ralph marked as passed
         let stories_passed = prd_after.user_stories.iter().filter(|s| s.passes).count() as u32;
@@ -393,14 +410,17 @@ venv/
 
         // Read ralph.sh's own metrics (iterations, elapsed_secs) so receipts
         // show real numbers, not zeros.
+        eprintln!("[alps-diag] reading ralph result");
         let ralph_result = read_ralph_result(&ralph_dir)?;
+        eprintln!("[alps-diag] ralph result: iterations={}, elapsed={}s", ralph_result.iterations, ralph_result.elapsed_secs);
 
-        eprintln!(
+        elog!(
             "[implement] done: {}/{} stories passed, {} commits, {} artifacts, {} iterations, {}s elapsed (deliverable: {})",
             stories_passed, stories_total, commits.len(), artifacts.len(),
             ralph_result.iterations, ralph_result.elapsed_secs,
             deliverable_path.display()
         );
+        eprintln!("[alps-diag] about to return Ok(Implementation)");
 
         Ok(Implementation {
             ralph_branch: prd_after.branch_name,

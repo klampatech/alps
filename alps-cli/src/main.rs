@@ -31,6 +31,7 @@ use alps_core::plan::PlanAgent;
 use alps_core::receipt::Receipts;
 use alps_core::review::ReviewAgent;
 use alps_core::task::{Done, Task};
+use alps_core::elog;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
@@ -70,6 +71,28 @@ enum Command {
         /// See SPEC §12 item 2 / Runtime Pitfall #16.
         #[arg(long, default_value = "")]
         deliverable_path: String,
+
+        /// Optional path to a dedicated orchestrator-telemetry log file.
+        ///
+        /// When set, the orchestrator's `elog!` writes (e.g. `[plan] running`,
+        /// `[implement] running`, `[done] accepted`) are also written to this
+        /// file with `O_APPEND` semantics. This protects the orchestrator's
+        /// stderr output from being overwritten by other writers that open the
+        /// same file with `O_WRONLY` (notably `tee /dev/stderr` in ralph.sh,
+        /// which would otherwise clobber the orchestrator's earlier lines
+        /// starting at byte 0).
+        ///
+        /// Typical wrapper pattern: point both the wrapper's `2> file` redirect
+        /// (catches codex's stderr via `tee /dev/stderr`) and `--telemetry-log`
+        /// (catches the orchestrator's elog! writes) at the same path. Both
+        /// streams land in the file, and the O_APPEND flag prevents
+        /// cross-writer overwrites.
+        ///
+        /// If unset, telemetry goes only to stderr (FD 2), which works for
+        /// TTY/pipe captures but loses data when other processes open the
+        /// redirected file without O_APPEND.
+        #[arg(long, default_value = "")]
+        telemetry_log: String,
     },
 
     /// List tasks in the current workspace.
@@ -84,19 +107,71 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Install a panic hook that writes panic info to a side file. The default
+    // panic hook writes to stderr — fine for interactive use, but a smoke-test
+    // wrapper's `2> file` redirect means the panic info is mixed with codex
+    // output. A side file is also preserved even if the main log is truncated
+    // or rotated. Set ALPS_PANIC_LOG=<path> in the wrapper to enable.
+    //
+    // This is the smoke #7 instrumentation (2026-08-06): the alps orchestrator
+    // dies after ralph.sh returns (last elog! = "[implement] invoking Ralph",
+    // .ralph-result.json written, but no "[implement] done" ever lands). With
+    // the panic hook, any Rust panic in the post-ralph code path leaves a
+    // backtrace + message in this file. If the file is empty, the orchestrator
+    // was killed by a signal (not a panic).
+    if let Ok(panic_log) = std::env::var("ALPS_PANIC_LOG") {
+        let panic_log = std::path::PathBuf::from(panic_log);
+        // Make sure parent dir exists
+        if let Some(parent) = panic_log.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let panic_log_for_hook = panic_log.clone();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            // Write the panic message + backtrace to the side file. We can't
+            // easily format the panic_info here, so write it raw and let the
+            // operator inspect it with `strings` or similar.
+            let bt = std::backtrace::Backtrace::force_capture();
+            let payload = format!(
+                "[alps-panic] {} at {}\n[alps-backtrace]\n{}\n",
+                panic_info,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                bt
+            );
+            let _ = std::fs::write(&panic_log_for_hook, &payload);
+            // Also try stderr as a fallback so operators not setting up
+            // ALPS_PANIC_LOG still see something.
+            eprintln!("[alps-panic] {}", panic_info);
+        }));
+    }
+
     tracing_subscriber::fmt::init();
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir, force, deliverable_path } => {
+        Command::Run { prompt, workdir, force, deliverable_path, telemetry_log } => {
+            // Export the telemetry-log path as an env var so the `elog!` macro
+            // (in alps-core/src/telemetry.rs) picks it up via `ALPS_TELEMETRY_LOG`.
+            // The macro opens the file with O_APPEND in a OnceLock-cached handle,
+            // so subsequent `elog!` calls in any module — including the loop
+            // driver and child agent code — write to the same file with atomic
+            // append semantics. This protects the orchestrator's stderr from
+            // being clobbered by `tee /dev/stderr` (which opens the same file
+            // with O_WRONLY without O_APPEND and would otherwise overwrite the
+            // orchestrator's earlier writes from byte 0).
+            if !telemetry_log.is_empty() {
+                std::env::set_var("ALPS_TELEMETRY_LOG", &telemetry_log);
+            }
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
-            eprintln!("alps list: not yet implemented");
+            elog!("alps list: not yet implemented");
             std::process::exit(1);
         }
         Command::Show { task_id } => {
-            eprintln!("alps show {}: not yet implemented", task_id);
+            elog!("alps show {}: not yet implemented", task_id);
             std::process::exit(1);
         }
     }
@@ -131,12 +206,12 @@ async fn run_task(
         // ralph_dir) is the right behavior here.
         match detect::detect(&prompt, &workdir) {
             Some(detected) => {
-                eprintln!("[detect] auto-detected deliverable-path: {}", detected.display());
+                elog!("[detect] auto-detected deliverable-path: {}", detected.display());
                 detected
             }
             None => {
                 let ralph_default = workdir.join("tasks").join(task_id.as_str()).join("implementation").join("ralph");
-                eprintln!("[detect] no viable prompt-derived path; using ralph nested git: {}", ralph_default.display());
+                elog!("[detect] no viable prompt-derived path; using ralph nested git: {}", ralph_default.display());
                 ralph_default
             }
         }
@@ -165,20 +240,20 @@ async fn run_task(
             threshold_secs,
         }) => {
             if !force {
-                eprintln!(
+                elog!(
                     "error: recent completion in workdir — task {} completed {}s ago (threshold {}s).",
                     prev, seconds_ago, threshold_secs
                 );
-                eprintln!(
+                elog!(
                     "       wrapping agent (Claude TUI / shell) may have re-invoked alps."
                 );
-                eprintln!(
+                elog!(
                     "       wait a few seconds, or pass --force to bypass this guard."
                 );
                 std::process::exit(2);
             }
             // --force: warn but proceed
-            eprintln!(
+            elog!(
                 "warning: bypassing workdir guard (task {} completed {}s ago)",
                 prev, seconds_ago
             );
@@ -186,7 +261,7 @@ async fn run_task(
         Err(e) => {
             // Other errors (malformed sentinel, IO) — warn but proceed.
             // A malformed sentinel shouldn't block legitimate runs.
-            eprintln!("warning: workdir guard check failed: {}", e);
+            elog!("warning: workdir guard check failed: {}", e);
         }
     }
 
@@ -199,7 +274,7 @@ async fn run_task(
     // Judge will walk, especially when --deliverable-path differs from
     // --workdir. See SPEC §12 item 2.
     if deliverable_path != workdir {
-        eprintln!(
+        elog!(
             "[alps] deliverable path: {} (workdir: {})",
             deliverable_path.display(),
             workdir.display()
@@ -219,14 +294,14 @@ async fn run_task(
     let branch = format!("alps/{}", task_id.as_str());
     if is_inside_git_repo(&workdir) {
         match create_branch(&workdir, &branch) {
-            Ok(()) => eprintln!("[alps] on branch: {}", branch),
+            Ok(()) => elog!("[alps] on branch: {}", branch),
             Err(GitOpsError::Git { op, msg }) => {
-                eprintln!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
-                eprintln!("warning: continuing on current branch (no per-task isolation)");
+                elog!("warning: per-task branch '{}' failed at {}: {}", branch, op, msg);
+                elog!("warning: continuing on current branch (no per-task isolation)");
             }
             Err(e) => {
-                eprintln!("warning: per-task branch failed: {}", e);
-                eprintln!("warning: continuing on current branch (no per-task isolation)");
+                elog!("warning: per-task branch failed: {}", e);
+                elog!("warning: continuing on current branch (no per-task isolation)");
             }
         }
     }
@@ -288,16 +363,16 @@ async fn run_task(
             ) {
                 Ok(CommitOutcome::NothingToCommit) => {} // silent — expected
                 Ok(CommitOutcome::Committed) => {
-                    eprintln!("[done] auto-committed final state");
+                    elog!("[done] auto-committed final state");
                 }
                 Ok(CommitOutcome::CommitFailed(msg)) => {
-                    eprintln!("warning: git commit failed: {}", msg);
+                    elog!("warning: git commit failed: {}", msg);
                 }
                 Err(GitOpsError::Git { op, msg }) => {
-                    eprintln!("warning: git {} error: {}", op, msg);
+                    elog!("warning: git {} error: {}", op, msg);
                 }
                 Err(e) => {
-                    eprintln!("warning: auto-commit skipped: {}", e);
+                    elog!("warning: auto-commit skipped: {}", e);
                 }
             }
 
@@ -312,14 +387,14 @@ async fn run_task(
             if let Err(e) =
                 alps_core::workdir_guard::mark_complete(&workdir, task_id.as_str())
             {
-                eprintln!("warning: failed to mark workdir complete: {}", e);
+                elog!("warning: failed to mark workdir complete: {}", e);
             }
 
             Ok(())
         }
         Err(e) => {
             error!(target: "alps.cli", error = %e, "task failed");
-            eprintln!("error: {}", e);
+            elog!("error: {}", e);
             std::process::exit(1);
         }
     }

@@ -9,6 +9,8 @@
 use std::path::Path;
 use std::process::Command;
 use thiserror::Error;
+use crate::elog;
+
 
 /// Pattern that excludes the ralph nested git repo from `git add -A`.
 /// Written to `<workdir>/.git/info/exclude` (git's per-repo, never-tracked
@@ -145,11 +147,11 @@ pub fn commit_smart_with_excludes(
     // The exclude is idempotent: we only append the line if it isn't
     // already present, so re-runs don't accumulate duplicates.
     if let Err(e) = ensure_ralph_excluded(dir) {
-        eprintln!("warning: failed to update .git/info/exclude: {} (commit may fail with embedded-repo error)", e);
+        elog!("warning: failed to update .git/info/exclude: {} (commit may fail with embedded-repo error)", e);
     }
     if let Some(dp) = deliverable_path {
         if let Err(e) = ensure_deliverable_excluded(dir, dp) {
-            eprintln!("warning: failed to exclude deliverable path: {} (workdir auto-commit may sweep the deliverable in)", e);
+            elog!("warning: failed to exclude deliverable path: {} (workdir auto-commit may sweep the deliverable in)", e);
         }
     }
     let add = Command::new("git")
