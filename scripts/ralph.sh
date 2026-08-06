@@ -132,11 +132,26 @@ for i in $(seq 1 $MAX_ITERATIONS); do
   echo "==============================================================="
 
   # Run the selected tool with the ralph prompt
+  #
+  # IMPORTANT: all three tee invocations use `tee -a /dev/stderr` (append mode).
+  # Without `-a`, tee opens the destination file with O_WRONLY|O_CREAT|O_TRUNC
+  # by default, which TRUNCATES the file to zero on every invocation. When the
+  # orchestrator's stderr (FD 2) is redirected to the same file (e.g. via a
+  # smoke-test wrapper's `2> file`), the orchestrator's earlier `elog!` writes
+  # (which use O_APPEND) get clobbered by tee's truncation. The orchestrator's
+  # O_APPEND writes then go to the new "end of file" (byte 0 after truncate),
+  # but `tee` is also writing from byte 0 with O_WRONLY, so the streams
+  # interleave destructively.
+  #
+  # With `tee -a`, tee opens the file with O_APPEND. Both writers (orchestrator
+  # + tee) atomically append to the end of the file, so neither clobbers the
+  # other. This is what unblocks smoke-style stderr capture for the operator
+  # pattern `exec alps run ... 2> file`.
   if [[ "$TOOL" == "amp" ]]; then
-    OUTPUT=$(cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all 2>&1 | tee -a /dev/stderr) || true
   elif [[ "$TOOL" == "claude" ]]; then
     # Claude Code: use --dangerously-skip-permissions for autonomous operation, --print for output
-    OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee -a /dev/stderr) || true
   else
     # Codex: --dangerously-bypass-approvals-and-sandbox = full autonomous mode.
     # The implement agent invokes ralph.sh with current_dir = the ralph workspace
@@ -150,7 +165,7 @@ for i in $(seq 1 $MAX_ITERATIONS); do
       RALPH_AGENTS="$SCRIPT_DIR/AGENTS.md"
     fi
     rm -f "$CODEX_LAST_MESSAGE"
-    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -o "$CODEX_LAST_MESSAGE" < "$RALPH_AGENTS" 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -o "$CODEX_LAST_MESSAGE" < "$RALPH_AGENTS" 2>&1 | tee -a /dev/stderr) || true
   fi
 
   # Check for completion signal
