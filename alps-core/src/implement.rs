@@ -39,6 +39,29 @@ pub enum ImplementError {
     #[error("failed to parse prd.json: {0}")]
     PrdParse(String),
 
+    /// Ralph (or whoever wrote .ralph-result.json) claimed `completed:
+    /// true`, but the prd.json shows fewer stories passing than the
+    /// plan called for. **We refuse to proceed to Review with an
+    /// incomplete deliverable** — Review and Judge would congratulate
+    /// themselves on a phantom green run. This is the bug the Tier 4
+    /// smoke #2 (2026-08-04, herdr pane wB1:p1) surfaced: codex hit a
+    /// tool-router JSON-RPC parse error mid-implementation, falsely
+    /// emitted `Ralph completed all tasks! Completed at iteration 4 of
+    /// 20`, wrote `completed: true` to .ralph-result.json, but the
+    /// prd.json showed 3/9 stories passing. The orchestrator trusted
+    /// the .ralph-result.json without cross-checking prd.json.
+    ///
+    /// Surfaced as `AlpsError::Implement` so the CLI exits non-zero
+    /// with a clear error message rather than silently producing a
+    /// look-good receipts.json.
+    #[error(
+        "ralph reported completed=true but only {passed}/{total} stories pass in prd.json. \
+         The deliverable is incomplete; refusing to proceed to Review. \
+         (This is the Tier 4 smoke #2 bug — the orchestrator guards against codex \
+         emitting 'completed' messages when the prd.json disagrees.)"
+    )]
+    IncompleteStories { passed: u32, total: u32 },
+
     #[error("serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
 }
