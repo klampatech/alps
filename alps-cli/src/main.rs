@@ -248,6 +248,27 @@ enum Command {
     },
 }
 
+/// Resolve the prompt text from CLI args. Three cases:
+/// - `prompt` (argv) wins if both are given — clap's `conflicts_with`
+///   blocks this at parse time, but the API still accepts both for tests.
+/// - `--prompt-file <path>` reads the prompt from disk and (best-effort)
+///   deletes the file after read. Failure to read returns an error.
+/// - Neither → error.
+///
+/// Extracted from the inline match in `main()` so the logic is unit-testable.
+fn resolve_prompt(prompt: Option<String>, prompt_file: Option<&str>) -> Result<String, String> {
+    match (prompt, prompt_file) {
+        (Some(p), _) => Ok(p),
+        (None, Some(path)) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read --prompt-file {:?}: {}", path, e))?;
+            let _ = std::fs::remove_file(path);
+            Ok(contents)
+        }
+        (None, None) => Err("either `prompt` or --prompt-file is required".to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // ── Process-group + parent-death hardening (SPEC §12 item 9.5 fix (iii)) ──
@@ -376,19 +397,10 @@ async fn main() -> Result<()> {
             // When --prompt-file is provided, delete the file after reading
             // (best-effort, non-blocking on failure) so the prompt text isn't
             // left on disk indefinitely.
-            let prompt = match (prompt, prompt_file) {
-                (Some(p), _) => p,
-                (None, Some(path)) => {
-                    let contents = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| {
-                            eprintln!("[alps-diag] failed to read --prompt-file {:?}: {}", path, e);
-                            std::process::exit(2);
-                        });
-                    let _ = std::fs::remove_file(&path);
-                    contents
-                }
-                (None, None) => {
-                    eprintln!("[alps-diag] error: either `prompt` or --prompt-file is required");
+            let prompt = match resolve_prompt(prompt, prompt_file.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[alps-diag] {}", e);
                     std::process::exit(2);
                 }
             };
@@ -672,6 +684,81 @@ fn is_inside_git_repo(dir: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_inside_git_repo;
+    use super::resolve_prompt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Generate a unique temp file path under std::env::temp_dir() so parallel
+    /// tests don't collide. Uses an atomic counter — `mktemp`-like behavior
+    /// without pulling in the `tempfile` crate.
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    fn unique_tmp_path(suffix: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("alps-test-{}-{}-{}{}", pid, n, std::any::type_name::<()>(), suffix))
+    }
+
+    #[test]
+    fn prompt_file_path_with_valid_content() {
+        // Wrapper writes a 5KB prompt to a file, resolve_prompt reads it,
+        // the contents reach run_task unchanged.
+        let path = unique_tmp_path(".txt");
+        let body = "Build a full-stack notes app at /tmp/x.\n".repeat(100); // ~5KB
+        std::fs::write(&path, &body).unwrap();
+
+        let result = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert_eq!(result.unwrap(), body, "file contents must round-trip unchanged");
+
+        // File is deleted after read.
+        assert!(!path.exists(), "file should be deleted after read");
+    }
+
+    #[test]
+    fn prompt_file_path_with_missing_file() {
+        // Wrapper points at a non-existent path; resolve_prompt returns
+        // an error containing the path and the io error.
+        let path = unique_tmp_path("-missing.txt");
+
+        let result = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(result.is_err(), "expected Err for missing file");
+        let err = result.unwrap_err();
+        assert!(err.contains("--prompt-file"), "error must mention --prompt-file: {}", err);
+        assert!(err.contains(path.to_str().unwrap()), "error must include the path: {}", err);
+        // Main() maps this to exit code 2 — verified by reading main.rs flow.
+    }
+
+    #[test]
+    fn prompt_and_prompt_file_both_given() {
+        // Both flags present: prompt (argv) wins. clap's conflicts_with
+        // prevents this at the CLI level, but the API is permissive so
+        // callers don't have to think about it.
+        let argv_prompt = Some("from argv".to_string());
+        let result = resolve_prompt(argv_prompt.clone(), Some("/tmp/some-file"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "from argv", "argv prompt should win when both given");
+    }
+
+    #[test]
+    fn prompt_file_deleted_after_read() {
+        // Pin the post-condition: the file is removed (best-effort) after
+        // resolve_prompt returns. This protects against prompt text being
+        // left on disk indefinitely in /tmp.
+        let path = unique_tmp_path(".txt");
+        std::fs::write(&path, "delete me after read").unwrap();
+        assert!(path.exists(), "precondition: file must exist before resolve");
+
+        let _ = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(!path.exists(), "file must be deleted after resolve_prompt returns Ok");
+    }
+
+    #[test]
+    fn resolve_prompt_with_neither_returns_error() {
+        // Defensive: neither flag → error (clap should reject this upstream
+        // because prompt is required, but the API must be defensive too).
+        let result = resolve_prompt(None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("required"));
+    }
 
     #[test]
     fn is_inside_git_repo_returns_true_for_alps_repo() {

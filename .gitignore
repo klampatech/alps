@@ -16,3 +16,6 @@ Cargo.lock.bak
 /progress.txt
 /.ralph-result.json
 /.codex-last-message.txt
+# Smoke archive (preserved receipts + deliverables from Tier-4 smokes).
+# Local-only — not part of the source repo. See smoke-archive/YYYY-MM-DD/<smoke>-preserved/.
+/smoke-archive/
