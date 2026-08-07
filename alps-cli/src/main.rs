@@ -238,6 +238,60 @@ enum Command {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── Process-group + parent-death hardening (SPEC §12 item 9.5 fix (iii)) ──
+    // Smoke #15 root cause (2026-08-07): the orchestrator was SIGTERMed by
+    // PID 1374425 — which is OUTSIDE alps's process tree (not a child of alps,
+    // not visible in strace -f). The most likely sender is the herdr pane
+    // babysitter: when a herdr pane sits idle for ~2 min, the babysitter
+    // SIGTERMs the entire pgroup, taking out the wrapper bash AND alps with
+    // it. The kill was overdue (codex finished 9/9 stories with
+    // <promise>COMPLETE</promise> 2 min earlier; alps was sitting in a
+    // futex waiting on the ralph.sh pipe).
+    //
+    // Two companion fixes:
+    //   (a) setpgid(0, 0) — make alps the leader of its own process group.
+    //       Then a pgroup-targeted SIGTERM (e.g. `kill -- -<pgid>`) hits
+    //       only the pane group, not alps.
+    //   (b) prctl(PR_SET_PDEATHSIG, SIGTERM) — when the parent process dies
+    //       (e.g. the wrapper bash exits or is killed), the kernel
+    //       automatically sends SIGTERM to alps. This is the SAFETY NET:
+    //       if the wrapper dies for any reason, alps won't be orphaned
+    //       eating resources / stuck in a futex.
+    //
+    // Both calls are no-ops in the smoke harness's view; the alps process
+    // still terminates when expected. They just decouple alps from herdr
+    // pgroup cleanup and ensure alps follows its parent.
+    #[cfg(unix)]
+    {
+        // SAFETY: setpgid with (0,0) sets the current process as the leader
+        // of its own process group. POSIX guarantees this can be done by
+        // any process for itself.
+        let pgid_result = unsafe { libc::setpgid(0, 0) };
+        if pgid_result != 0 {
+            eprintln!(
+                "[alps-diag] setpgid(0,0) failed: errno={} (non-fatal; continuing)",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            eprintln!(
+                "[alps-diag] setpgid(0,0) ok; alps pgid={}",
+                std::process::id()
+            );
+        }
+        // SAFETY: PR_SET_PDEATHSIG / SIGTERM is the standard "die when
+        // parent dies" pattern. The parent here is the wrapper bash — when
+        // herdr SIGTERMs the wrapper, the kernel SIGTERMs alps too.
+        let prctl_result = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+        if prctl_result != 0 {
+            eprintln!(
+                "[alps-diag] prctl(PR_SET_PDEATHSIG, SIGTERM) failed: errno={} (non-fatal)",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            eprintln!("[alps-diag] prctl(PR_SET_PDEATHSIG, SIGTERM) ok");
+        }
+    }
+
     // Install SIGTERM/SIGINT/SIGHUP handlers BEFORE anything else (panic hook,
     // tracing, even args parsing). See §12 item 9 (2026-08-06): the orchestrator
     // dies mid-`implement.run` with no panic and no core dump — most likely an

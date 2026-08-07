@@ -10,6 +10,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "libc",
  "signal-hook",
  "tokio",
  "tracing",

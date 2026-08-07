@@ -339,6 +339,10 @@ venv/
             "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}",
             self.config.tool, self.config.max_iterations, prd.user_stories.len()
         );
+        eprintln!(
+            "[alps-diag] implement.run: invoking ralph.sh (tool={}, max_iter={})",
+            self.config.tool, self.config.max_iterations
+        );
         let ralph_status = Command::new(&self.config.ralph_path)
             .args([
                 "--tool", self.config.tool.as_str(),
@@ -353,6 +357,11 @@ venv/
                 op: "spawn ralph".to_string(),
                 msg: e.to_string(),
             })?;
+        eprintln!(
+            "[alps-diag] implement.run: ralph.sh status() returned (success={}, code={:?})",
+            ralph_status.success(),
+            ralph_status.code()
+        );
 
         // IMPORTANT: ralph hitting max-iterations is NOT a hard error.
         // It's a partial success — some stories may be marked `passes: true`
