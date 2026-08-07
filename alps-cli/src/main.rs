@@ -178,8 +178,20 @@ struct Args {
 enum Command {
     /// Run a new task with the given prompt.
     Run {
-        /// The prompt describing the work to do.
-        prompt: String,
+        /// The prompt describing the work to do. May be omitted if
+        /// --prompt-file is given (preferred for smoke harnesses — see
+        /// §12 item 9.5 fix (ii) on alps-side argv cleanup).
+        #[arg(conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+
+        /// Read the prompt from this file instead of argv. The temp-file
+        /// path appears in alps's /proc/<pid>/cmdline instead of the raw
+        /// prompt text, so `pkill -f <keyword>` patterns emitted by codex
+        /// (e.g. `pkill -f vite`) can't accidentally match alps argv.
+        /// The wrapper creates the file with `mktemp -t alps-prompt.XXXXXX.txt`
+        /// and alps will read+delete it on startup.
+        #[arg(long, conflicts_with = "prompt", value_name = "PATH")]
+        prompt_file: Option<String>,
 
         /// Working directory (defaults to current directory).
         #[arg(long, default_value = ".")]
@@ -346,7 +358,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir, force, deliverable_path, telemetry_log } => {
+        Command::Run { prompt, prompt_file, workdir, force, deliverable_path, telemetry_log } => {
             // Export the telemetry-log path as an env var so the `elog!` macro
             // (in alps-core/src/telemetry.rs) picks it up via `ALPS_TELEMETRY_LOG`.
             // The macro opens the file with O_APPEND in a OnceLock-cached handle,
@@ -359,6 +371,27 @@ async fn main() -> Result<()> {
             if !telemetry_log.is_empty() {
                 std::env::set_var("ALPS_TELEMETRY_LOG", &telemetry_log);
             }
+            // Resolve the prompt: either read from --prompt-file (preferred for
+            // smoke harnesses — §12 item 9.5 fix (ii)) or use argv directly.
+            // When --prompt-file is provided, delete the file after reading
+            // (best-effort, non-blocking on failure) so the prompt text isn't
+            // left on disk indefinitely.
+            let prompt = match (prompt, prompt_file) {
+                (Some(p), _) => p,
+                (None, Some(path)) => {
+                    let contents = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| {
+                            eprintln!("[alps-diag] failed to read --prompt-file {:?}: {}", path, e);
+                            std::process::exit(2);
+                        });
+                    let _ = std::fs::remove_file(&path);
+                    contents
+                }
+                (None, None) => {
+                    eprintln!("[alps-diag] error: either `prompt` or --prompt-file is required");
+                    std::process::exit(2);
+                }
+            };
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
