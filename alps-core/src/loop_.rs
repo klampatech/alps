@@ -100,7 +100,14 @@ fn run_iteration<'a>(
         // fail loudly with `ImplementError::IncompleteStories` so the
         // CLI exits non-zero and the operator sees the discrepancy.
         let m = &task.state.implementation.metrics;
+        eprintln!(
+            "[alps-diag] run_iteration: implement-completion guard check: stories_passed={}, stories_total={}",
+            m.stories_passed, m.stories_total
+        );
         if m.stories_passed != m.stories_total {
+            eprintln!(
+                "[alps-diag] run_iteration: implement-completion guard FAILED — returning ImplementError::IncompleteStories"
+            );
             return Err(AlpsError::Implement(Box::new(
                 crate::implement::ImplementError::IncompleteStories {
                     passed: m.stories_passed,
@@ -108,6 +115,7 @@ fn run_iteration<'a>(
                 },
             )));
         }
+        eprintln!("[alps-diag] run_iteration: implement-completion guard PASSED");
 
         // ── AGENTS.md: extract patterns from ralph's progress.txt ──
         // Ralph writes `## Codebase Patterns` to progress.txt as it discovers

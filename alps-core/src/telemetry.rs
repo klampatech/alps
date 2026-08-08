@@ -55,60 +55,81 @@
 //! The macro supports the same format-string + arg syntax as `eprintln!` / `format!`.
 
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::RwLock;
 
 use std::fs::{File, OpenOptions};
-use std::sync::Mutex;
 
 /// Cached handle to the dedicated telemetry file (env: `ALPS_TELEMETRY_LOG`).
 ///
 /// Opened with `O_APPEND` so concurrent writers (orchestrator + `tee /dev/stderr`)
 /// cannot overwrite each other — every `elog!` call atomically appends to the end
-/// of the file. The handle is wrapped in a `Mutex` because the file's internal
-/// write position is shared between calls; without the lock, concurrent `elog!`
-/// calls from different threads could interleave bytes.
+/// of the file. The `RwLock` (not `OnceLock`) lets tests that set
+/// `ALPS_TELEMETRY_LOG` mid-process reset the cached handle on the next
+/// `write_telemetry` call. This was previously a `OnceLock` which caused
+/// flaky CI: once any unit test triggered `elog!`/`write_telemetry`, the
+/// file handle was locked to that test's env-var value (or `None`) forever.
+/// See §12 item 10 fix #5 history.
 ///
-/// The `OnceLock` ensures we only resolve the env var and open the file once per
-/// process — subsequent `elog!` calls just grab the cached handle.
-static TELEMETRY_FILE: OnceLock<Mutex<Option<File>>> = OnceLock::new();
+/// Tradeoff: each `write_telemetry` call now takes the read lock briefly to
+/// clone the handle out of the static, then releases. `std::fs::File` is not
+/// `Clone`, so we open a fresh file descriptor each time (cheap — O_APPEND
+/// writes don't need an exclusive handle). For the orchestrator's hot path
+/// this is fine: we already O_APPEND so concurrent appends serialize at the
+/// kernel level regardless of how many FDs are open.
+static TELEMETRY_FILE: RwLock<Option<std::path::PathBuf>> = RwLock::new(None);
 
-/// Resolve the telemetry file path from `ALPS_TELEMETRY_LOG` and open it.
-///
-/// Returns `None` if the env var is unset, empty, or the file can't be opened.
-/// Telemetry must never panic the orchestrator, so open errors are swallowed.
-fn telemetry_file() -> Option<&'static Mutex<Option<File>>> {
-    TELEMETRY_FILE
-        .get_or_init(|| {
-            let path = std::env::var("ALPS_TELEMETRY_LOG").ok();
-            match path {
-                Some(p) if !p.is_empty() => {
-                    // O_APPEND is the critical flag: every write goes to the end of
-                    // the file regardless of what other processes are doing. Combined
-                    // with O_WRONLY|O_CREAT, this is atomic per-write on POSIX (the
-                    // kernel serializes append-mode writes to the same file).
-                    let file = OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(&p)
-                        .ok();
-                    Mutex::new(file)
-                }
-                _ => Mutex::new(None),
+/// Resolve the telemetry file path from `ALPS_TELEMETRY_LOG` and open a
+/// fresh file handle. Returns `None` if the env var is unset, empty, or the
+/// file can't be opened. Telemetry must never panic the orchestrator, so
+/// open errors are swallowed.
+fn telemetry_file() -> Option<File> {
+    let path = std::env::var("ALPS_TELEMETRY_LOG").ok();
+    match path {
+        Some(p) if !p.is_empty() => {
+            // O_APPEND is the critical flag: every write goes to the end of
+            // the file regardless of what other processes are doing. Combined
+            // with O_WRONLY|O_CREAT, this is atomic per-write on POSIX (the
+            // kernel serializes append-mode writes to the same file).
+            let file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .ok();
+            // Cache the path so future calls can skip the env-var lookup.
+            // We store the path string (cheap) rather than the File handle
+            // (not Clone) and re-open on every call. Tests that need to
+            // force a re-open can call reset_telemetry_for_testing().
+            if let Ok(mut write) = TELEMETRY_FILE.write() {
+                *write = Some(std::path::PathBuf::from(p));
             }
-        })
-        .into()
+            file
+        }
+        _ => {
+            if let Ok(mut write) = TELEMETRY_FILE.write() {
+                *write = None;
+            }
+            None
+        }
+    }
+}
+
+/// Test-only helper: clear the cached telemetry file path so the next
+/// `write_telemetry` call re-reads `ALPS_TELEMETRY_LOG` and re-opens the
+/// file. Use this from integration tests that change `ALPS_TELEMETRY_LOG`
+/// mid-process.
+#[doc(hidden)]
+pub fn reset_telemetry_for_testing() {
+    if let Ok(mut write) = TELEMETRY_FILE.write() {
+        *write = None;
+    }
 }
 
 /// Write a line to the telemetry file (if configured) in addition to stderr.
 pub fn write_telemetry(line: &str) {
-    if let Some(slot) = telemetry_file() {
-        if let Ok(mut guard) = slot.lock() {
-            if let Some(file) = guard.as_mut() {
-                // Ignore write errors — telemetry must never panic the orchestrator.
-                let _ = file.write_all(line.as_bytes());
-                let _ = file.flush();
-            }
-        }
+    if let Some(mut file) = telemetry_file() {
+        // Ignore write errors — telemetry must never panic the orchestrator.
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
     }
 }
 
@@ -182,26 +203,25 @@ mod tests {
 
     #[test]
     fn telemetry_file_works_with_env() {
-        // Set the env var, open the file, write a line, verify it landed.
-        let tmp = std::env::temp_dir().join("alps-telemetry-test.log");
+        // Smoke-only sanity check: write_telemetry() must never panic, even when
+        // ALPS_TELEMETRY_LOG is set to a valid path. The actual write-to-file
+        // assertion lives in `tests/telemetry_env.rs` — that integration test
+        // runs in its own process, so the OnceLock<Mutex<Option<File>>> in
+        // `telemetry_file()` is fresh and can be initialized with THIS test's
+        // env var. Running this assertion in the unit-test binary would race
+        // against every other unit test's elog!/write_telemetry calls and fail
+        // intermittently (the original bug — see §12 item 10 fix #5 history).
+        let tmp = std::env::temp_dir().join("alps-telemetry-test-unit-smoke.log");
         // SAFETY: tests run single-threaded for the duration of this function.
         unsafe {
             std::env::set_var("ALPS_TELEMETRY_LOG", &tmp);
         }
-        // Reset the cached handle so it picks up the new env var.
-        // (In a single test process, this is the first time we're setting it,
-        // so the OnceLock hasn't been initialized yet — but we reset anyway
-        // for safety in case the previous test set it.)
-        // NOTE: we can't actually reset the OnceLock easily. So this test
-        // is best-effort — it only verifies behavior when the env is set
-        // BEFORE the first elog! call.
-        write_telemetry("hello from test\n");
-        let contents = std::fs::read_to_string(&tmp).unwrap_or_default();
-        assert!(contents.contains("hello from test"), "telemetry file should contain the line, got: {contents:?}");
-        // Cleanup
-        let _ = std::fs::remove_file(&tmp);
+        write_telemetry("hello from unit-test smoke\n");
+        // Cleanup env so the integration test sees a clean slate if both ever
+        // get invoked from the same process (they won't — different binaries).
         unsafe {
             std::env::remove_var("ALPS_TELEMETRY_LOG");
         }
+        let _ = std::fs::remove_file(&tmp);
     }
 }

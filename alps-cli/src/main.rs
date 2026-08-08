@@ -36,6 +36,137 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use tracing::{error, info};
 
+/// Install SIGTERM / SIGINT / SIGHUP handlers that write a marker + backtrace
+/// to `$ALPS_SIGTERM_LOG` (default `/tmp/alps-sigterm.log`) BEFORE emulating
+/// the default disposition. This is the diagnostic unlock for §12 item 9:
+/// smoke #10 showed the orchestrator dies mid-`implement.run` with no panic
+/// and no core dump — most likely external SIGTERM, but the source was not
+/// visible. The handler captures (a) which signal arrived, (b) the exact
+/// instant, (c) a backtrace of the current async task, so we can correlate
+/// with `strace -f -e signal=all` to identify the sender PID.
+///
+/// We use `signal_hook::low_level` (raw `register`) rather than the high-
+/// level iterator because we want to log on EACH signal, even if multiple
+/// arrive before the runtime yields. Tokio's signal driver is NOT used —
+/// it would defer handling until a future is `.await`ed, which is too late
+/// if the orchestrator is mid-`process::exit` cleanup.
+///
+/// Set `ALPS_SIGTERM_LOG=<path>` to override the side-file path. If unset,
+/// signals are still handled (default disposition: terminate) but no log
+/// file is written.
+#[cfg(unix)]
+fn install_signal_handlers() {
+    use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::low_level;
+
+    let sig_log_path = std::env::var("ALPS_SIGTERM_LOG")
+        .ok()
+        .filter(|p| !p.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/alps-sigterm.log"));
+
+    // Ensure parent dir exists (e.g. /tmp/alps-tier4-smoke-11/).
+    if let Some(parent) = sig_log_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Async-signal-safe stderr write. We avoid `libc::write` linkage
+    // by inlining a `nix`-free wrapper — POSIX guarantees `write(2)` is
+    // async-signal-safe.
+    //
+    // SAFETY: `write(2)` on FD 2 (stderr) is async-signal-safe per POSIX.1-2017
+    // §2.4.3. The pointer arithmetic only dereferences bytes from the same
+    // `&str` slice that was passed in, so it cannot escape the caller's
+    // lifetime even if the caller goes out of scope mid-signal (the kernel
+    // copies to its own buffer for queued signals; non-queued signals just
+    // race and either succeed or fail).
+    unsafe fn libc_write_stderr(s: &str) {
+        extern "C" {
+            fn write(fd: i32, buf: *const u8, count: usize) -> isize;
+        }
+        let fd = 2;
+        let bytes = s.as_bytes();
+        let mut written = 0;
+        while written < bytes.len() {
+            let n = write(fd, bytes.as_ptr().add(written), bytes.len() - written);
+            if n <= 0 {
+                break;
+            }
+            written += n as usize;
+        }
+    }
+
+    // Write the marker for one signal arrival and re-raise with the default
+    // disposition. Each signal gets its OWN closure (signal-hook 0.3 dropped
+    // the `extern "C" fn(i32)` callback API in favor of `Fn()` closures that
+    // don't receive the signal number — the trade-off is we register three
+    // identical-but-tagged handlers instead of one dispatching handler).
+    fn make_handler(sig_name: &'static str) -> impl Fn() + Send + Sync + 'static {
+        move || {
+            let payload = format!(
+                "[alps-signal] received {} at unix_ts={}\n[alps-signal-backtrace]\n{:?}\n",
+                sig_name,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0),
+                std::backtrace::Backtrace::force_capture(),
+            );
+            // Resolve target at signal time so a wrapper that sets the env
+            // var AFTER process start still captures. Fall back to default.
+            let target = std::env::var("ALPS_SIGTERM_LOG")
+                .ok()
+                .filter(|p| !p.is_empty())
+                .unwrap_or_else(|| "/tmp/alps-sigterm.log".to_string());
+            let _ = std::fs::write(&target, &payload);
+            // SAFETY: see libc_write_stderr doc-comment.
+            unsafe {
+                libc_write_stderr(&payload);
+            }
+            // Re-raise with the default disposition so the process actually
+            // terminates (and strace sees the canonical exit). Without this,
+            // we'd eat the signal and the orchestrator would limp on.
+            let sig_id = match sig_name {
+                "SIGTERM" => SIGTERM,
+                "SIGINT" => SIGINT,
+                "SIGHUP" => SIGHUP,
+                _ => SIGTERM,
+            };
+            low_level::emulate_default_handler(sig_id).ok();
+        }
+    }
+
+    // Register one handler per signal we care about. A failure to register
+    // is non-fatal — log to stderr and continue. The orchestrator will
+    // still function, just without signal diagnostics.
+    let handlers: [(i32, Box<dyn Fn() + Send + Sync>); 3] = [
+        (SIGTERM, Box::new(make_handler("SIGTERM"))),
+        (SIGINT, Box::new(make_handler("SIGINT"))),
+        (SIGHUP, Box::new(make_handler("SIGHUP"))),
+    ];
+    for (sig, handler) in handlers {
+        if let Err(e) = unsafe { low_level::register(sig, handler) } {
+            eprintln!("[alps-diag] failed to register signal handler for {}: {}", sig, e);
+        }
+    }
+    // Also write a one-time "handlers installed" line so the post-mortem
+    // can confirm the diagnostic was active during the run (vs. the binary
+    // being a pre-handler version).
+    let install_marker = format!(
+        "[alps-signal] handlers installed at unix_ts={} for SIGTERM/SIGINT/SIGHUP\n",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    );
+    let _ = std::fs::write(&sig_log_path, install_marker);
+}
+
+#[cfg(not(unix))]
+fn install_signal_handlers() {
+    // No-op on non-Unix. The smoke harness is Linux-only anyway.
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "alps", version, about = "Agentic Loop Programming System")]
 struct Args {
@@ -47,8 +178,20 @@ struct Args {
 enum Command {
     /// Run a new task with the given prompt.
     Run {
-        /// The prompt describing the work to do.
-        prompt: String,
+        /// The prompt describing the work to do. May be omitted if
+        /// --prompt-file is given (preferred for smoke harnesses — see
+        /// §12 item 9.5 fix (ii) on alps-side argv cleanup).
+        #[arg(conflicts_with = "prompt_file")]
+        prompt: Option<String>,
+
+        /// Read the prompt from this file instead of argv. The temp-file
+        /// path appears in alps's /proc/<pid>/cmdline instead of the raw
+        /// prompt text, so `pkill -f <keyword>` patterns emitted by codex
+        /// (e.g. `pkill -f vite`) can't accidentally match alps argv.
+        /// The wrapper creates the file with `mktemp -t alps-prompt.XXXXXX.txt`
+        /// and alps will read+delete it on startup.
+        #[arg(long, conflicts_with = "prompt", value_name = "PATH")]
+        prompt_file: Option<String>,
 
         /// Working directory (defaults to current directory).
         #[arg(long, default_value = ".")]
@@ -105,8 +248,93 @@ enum Command {
     },
 }
 
+/// Resolve the prompt text from CLI args. Three cases:
+/// - `prompt` (argv) wins if both are given — clap's `conflicts_with`
+///   blocks this at parse time, but the API still accepts both for tests.
+/// - `--prompt-file <path>` reads the prompt from disk and (best-effort)
+///   deletes the file after read. Failure to read returns an error.
+/// - Neither → error.
+///
+/// Extracted from the inline match in `main()` so the logic is unit-testable.
+fn resolve_prompt(prompt: Option<String>, prompt_file: Option<&str>) -> Result<String, String> {
+    match (prompt, prompt_file) {
+        (Some(p), _) => Ok(p),
+        (None, Some(path)) => {
+            let contents = std::fs::read_to_string(path)
+                .map_err(|e| format!("failed to read --prompt-file {:?}: {}", path, e))?;
+            let _ = std::fs::remove_file(path);
+            Ok(contents)
+        }
+        (None, None) => Err("either `prompt` or --prompt-file is required".to_string()),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ── Process-group + parent-death hardening (SPEC §12 item 9.5 fix (iii)) ──
+    // Smoke #15 root cause (2026-08-07): the orchestrator was SIGTERMed by
+    // PID 1374425 — which is OUTSIDE alps's process tree (not a child of alps,
+    // not visible in strace -f). The most likely sender is the herdr pane
+    // babysitter: when a herdr pane sits idle for ~2 min, the babysitter
+    // SIGTERMs the entire pgroup, taking out the wrapper bash AND alps with
+    // it. The kill was overdue (codex finished 9/9 stories with
+    // <promise>COMPLETE</promise> 2 min earlier; alps was sitting in a
+    // futex waiting on the ralph.sh pipe).
+    //
+    // Two companion fixes:
+    //   (a) setpgid(0, 0) — make alps the leader of its own process group.
+    //       Then a pgroup-targeted SIGTERM (e.g. `kill -- -<pgid>`) hits
+    //       only the pane group, not alps.
+    //   (b) prctl(PR_SET_PDEATHSIG, SIGTERM) — when the parent process dies
+    //       (e.g. the wrapper bash exits or is killed), the kernel
+    //       automatically sends SIGTERM to alps. This is the SAFETY NET:
+    //       if the wrapper dies for any reason, alps won't be orphaned
+    //       eating resources / stuck in a futex.
+    //
+    // Both calls are no-ops in the smoke harness's view; the alps process
+    // still terminates when expected. They just decouple alps from herdr
+    // pgroup cleanup and ensure alps follows its parent.
+    #[cfg(unix)]
+    {
+        // SAFETY: setpgid with (0,0) sets the current process as the leader
+        // of its own process group. POSIX guarantees this can be done by
+        // any process for itself.
+        let pgid_result = unsafe { libc::setpgid(0, 0) };
+        if pgid_result != 0 {
+            eprintln!(
+                "[alps-diag] setpgid(0,0) failed: errno={} (non-fatal; continuing)",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            eprintln!(
+                "[alps-diag] setpgid(0,0) ok; alps pgid={}",
+                std::process::id()
+            );
+        }
+        // SAFETY: PR_SET_PDEATHSIG / SIGTERM is the standard "die when
+        // parent dies" pattern. The parent here is the wrapper bash — when
+        // herdr SIGTERMs the wrapper, the kernel SIGTERMs alps too.
+        let prctl_result = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+        if prctl_result != 0 {
+            eprintln!(
+                "[alps-diag] prctl(PR_SET_PDEATHSIG, SIGTERM) failed: errno={} (non-fatal)",
+                std::io::Error::last_os_error()
+            );
+        } else {
+            eprintln!("[alps-diag] prctl(PR_SET_PDEATHSIG, SIGTERM) ok");
+        }
+    }
+
+    // Install SIGTERM/SIGINT/SIGHUP handlers BEFORE anything else (panic hook,
+    // tracing, even args parsing). See §12 item 9 (2026-08-06): the orchestrator
+    // dies mid-`implement.run` with no panic and no core dump — most likely an
+    // external SIGTERM. The handlers write a marker + backtrace to
+    // $ALPS_SIGTERM_LOG (default /tmp/alps-sigterm.log) and re-raise with the
+    // default disposition so the process still terminates. Pair with
+    // `strace -f -e signal=all -p <pid>` in the smoke wrapper to identify the
+    // sender.
+    install_signal_handlers();
+
     // Install a panic hook that writes panic info to a side file. The default
     // panic hook writes to stderr — fine for interactive use, but a smoke-test
     // wrapper's `2> file` redirect means the panic info is mixed with codex
@@ -151,7 +379,7 @@ async fn main() -> Result<()> {
     let args = Args::parse();
 
     match args.command {
-        Command::Run { prompt, workdir, force, deliverable_path, telemetry_log } => {
+        Command::Run { prompt, prompt_file, workdir, force, deliverable_path, telemetry_log } => {
             // Export the telemetry-log path as an env var so the `elog!` macro
             // (in alps-core/src/telemetry.rs) picks it up via `ALPS_TELEMETRY_LOG`.
             // The macro opens the file with O_APPEND in a OnceLock-cached handle,
@@ -164,6 +392,18 @@ async fn main() -> Result<()> {
             if !telemetry_log.is_empty() {
                 std::env::set_var("ALPS_TELEMETRY_LOG", &telemetry_log);
             }
+            // Resolve the prompt: either read from --prompt-file (preferred for
+            // smoke harnesses — §12 item 9.5 fix (ii)) or use argv directly.
+            // When --prompt-file is provided, delete the file after reading
+            // (best-effort, non-blocking on failure) so the prompt text isn't
+            // left on disk indefinitely.
+            let prompt = match resolve_prompt(prompt, prompt_file.as_deref()) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("[alps-diag] {}", e);
+                    std::process::exit(2);
+                }
+            };
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
         Command::List => {
@@ -444,6 +684,81 @@ fn is_inside_git_repo(dir: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::is_inside_git_repo;
+    use super::resolve_prompt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Generate a unique temp file path under std::env::temp_dir() so parallel
+    /// tests don't collide. Uses an atomic counter — `mktemp`-like behavior
+    /// without pulling in the `tempfile` crate.
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    fn unique_tmp_path(suffix: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        std::env::temp_dir().join(format!("alps-test-{}-{}-{}{}", pid, n, std::any::type_name::<()>(), suffix))
+    }
+
+    #[test]
+    fn prompt_file_path_with_valid_content() {
+        // Wrapper writes a 5KB prompt to a file, resolve_prompt reads it,
+        // the contents reach run_task unchanged.
+        let path = unique_tmp_path(".txt");
+        let body = "Build a full-stack notes app at /tmp/x.\n".repeat(100); // ~5KB
+        std::fs::write(&path, &body).unwrap();
+
+        let result = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+        assert_eq!(result.unwrap(), body, "file contents must round-trip unchanged");
+
+        // File is deleted after read.
+        assert!(!path.exists(), "file should be deleted after read");
+    }
+
+    #[test]
+    fn prompt_file_path_with_missing_file() {
+        // Wrapper points at a non-existent path; resolve_prompt returns
+        // an error containing the path and the io error.
+        let path = unique_tmp_path("-missing.txt");
+
+        let result = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(result.is_err(), "expected Err for missing file");
+        let err = result.unwrap_err();
+        assert!(err.contains("--prompt-file"), "error must mention --prompt-file: {}", err);
+        assert!(err.contains(path.to_str().unwrap()), "error must include the path: {}", err);
+        // Main() maps this to exit code 2 — verified by reading main.rs flow.
+    }
+
+    #[test]
+    fn prompt_and_prompt_file_both_given() {
+        // Both flags present: prompt (argv) wins. clap's conflicts_with
+        // prevents this at the CLI level, but the API is permissive so
+        // callers don't have to think about it.
+        let argv_prompt = Some("from argv".to_string());
+        let result = resolve_prompt(argv_prompt.clone(), Some("/tmp/some-file"));
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "from argv", "argv prompt should win when both given");
+    }
+
+    #[test]
+    fn prompt_file_deleted_after_read() {
+        // Pin the post-condition: the file is removed (best-effort) after
+        // resolve_prompt returns. This protects against prompt text being
+        // left on disk indefinitely in /tmp.
+        let path = unique_tmp_path(".txt");
+        std::fs::write(&path, "delete me after read").unwrap();
+        assert!(path.exists(), "precondition: file must exist before resolve");
+
+        let _ = resolve_prompt(None, Some(path.to_str().unwrap()));
+        assert!(!path.exists(), "file must be deleted after resolve_prompt returns Ok");
+    }
+
+    #[test]
+    fn resolve_prompt_with_neither_returns_error() {
+        // Defensive: neither flag → error (clap should reject this upstream
+        // because prompt is required, but the API must be defensive too).
+        let result = resolve_prompt(None, None);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("required"));
+    }
 
     #[test]
     fn is_inside_git_repo_returns_true_for_alps_repo() {
