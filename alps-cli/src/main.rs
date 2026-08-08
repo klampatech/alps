@@ -246,6 +246,37 @@ enum Command {
         /// Task ID.
         task_id: String,
     },
+
+    /// Run the Ralph loop directly (no Plan/Review/Judge). Useful for
+    /// operator-driven iteration on a pre-written prd.json, and as the
+    /// smoke harness entry point now that the loop lives in-process.
+    ///
+    /// 1:1 parity with `scripts/ralph.sh` — same CLI shape (`--tool` +
+    /// positional max_iterations), same state-file semantics, same
+    /// `.ralph-result.json` contract. The only operational difference is
+    /// no subprocess: this `alps` process IS Ralph.
+    Ralph {
+        /// Tool backend. Must be `amp`, `claude`, or `codex`.
+        #[arg(long, default_value = "codex")]
+        tool: String,
+
+        /// Maximum iterations before giving up. Defaults to 10 (matches
+        /// the bash CLI default).
+        #[arg(default_value = "10")]
+        max_iterations: u32,
+
+        /// The Ralph working directory. All state files
+        /// (prd.json, progress.txt, .ralph-result.json, archive/) live here.
+        /// Defaults to the current directory.
+        #[arg(long, default_value = ".")]
+        ralph_dir: String,
+
+        /// Directory containing the vendored prompt files (AGENTS.md,
+        /// CLAUDE.md, prompt.md). Defaults to `<alps_root>/scripts/`
+        /// resolved from the binary's own path.
+        #[arg(long, default_value = "")]
+        script_dir: String,
+    },
 }
 
 /// Resolve the prompt text from CLI args. Three cases:
@@ -414,8 +445,107 @@ async fn main() -> Result<()> {
             elog!("alps show {}: not yet implemented", task_id);
             std::process::exit(1);
         }
+        Command::Ralph { tool, max_iterations, ralph_dir, script_dir } => {
+            run_ralph_subcommand(tool, max_iterations, ralph_dir, script_dir).await?;
+        }
     }
     Ok(())
+}
+
+/// `alps ralph` subcommand handler — runs the Ralph loop in-process.
+///
+/// This is a thin CLI wrapper over `alps_core::ralph::run`. The CLI
+/// exists for two reasons:
+///
+/// 1. **Operator ergonomics**: `alps ralph --tool codex 5 --ralph-dir /tmp/foo`
+///    replaces `./scripts/ralph.sh --tool codex 5` with the same observable
+///    behavior (state files in `ralph_dir`, `.ralph-result.json` written on
+///    exit, `completed: bool` semantics).
+/// 2. **Smoke harness compatibility**: existing smoke harnesses that
+///    exec `alps ralph` will keep working without modification.
+///
+/// Subprocess semantics: NONE. This command does NOT spawn a child
+/// process — the Ralph loop runs in the same process as the CLI. This is
+/// the whole point of the port (smoke #15 + #18 lived at the bash↔Rust
+/// IPC boundary; this command removes that boundary for operator-driven
+/// runs too).
+async fn run_ralph_subcommand(
+    tool: String,
+    max_iterations: u32,
+    ralph_dir: String,
+    script_dir: String,
+) -> Result<()> {
+    use alps_core::implement::RalphTool;
+    use alps_core::ralph::{self, RalphConfig};
+
+    // Validate the tool string. Same validation as bash (lines 41-45).
+    let tool_enum = match tool.as_str() {
+        "amp" => RalphTool::Amp,
+        "claude" => RalphTool::Claude,
+        "codex" => RalphTool::Codex,
+        other => {
+            elog!(
+                "alps ralph: invalid tool '{}'. Must be 'amp', 'claude', or 'codex'.",
+                other
+            );
+            std::process::exit(1);
+        }
+    };
+
+    let ralph_dir = PathBuf::from(ralph_dir);
+    if !ralph_dir.exists() {
+        elog!(
+            "alps ralph: ralph_dir does not exist: {}",
+            ralph_dir.display()
+        );
+        std::process::exit(1);
+    }
+
+    // Resolve script_dir. Default: <alps_root>/scripts/ derived from the
+    // binary's own path. Same resolution logic as the `run` subcommand
+    // uses for ralph.sh — three parents up from `target/{debug,release}/alps`.
+    let resolved_script_dir = if script_dir.trim().is_empty() {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+            .map(|p| p.join("scripts"))
+            .unwrap_or_else(|| PathBuf::from("./scripts"))
+    } else {
+        PathBuf::from(script_dir)
+    };
+
+    elog!(
+        "alps ralph: tool={}, max_iter={}, ralph_dir={}, script_dir={}",
+        tool_enum,
+        max_iterations,
+        ralph_dir.display(),
+        resolved_script_dir.display()
+    );
+
+    let cfg = RalphConfig::new(ralph_dir, resolved_script_dir, tool_enum, max_iterations);
+    match ralph::run(cfg).await {
+        Ok(result) => {
+            if result.completed {
+                elog!(
+                    "alps ralph: completed at iteration {}/{} ({}s elapsed)",
+                    result.iterations, max_iterations, result.elapsed_secs
+                );
+                std::process::exit(0);
+            } else {
+                elog!(
+                    "alps ralph: reached max iterations ({}) without completing all tasks ({}s elapsed)",
+                    max_iterations, result.elapsed_secs
+                );
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            elog!("alps ralph: error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 async fn run_task(
