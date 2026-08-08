@@ -8,6 +8,7 @@ use crate::agent::{Agent, sealed};
 use crate::domain::{
     DefinitionOfDone, Plan, PlanId, Prompt, StoryId, UserStory,
 };
+use crate::elog;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -229,7 +230,7 @@ impl Agent for PlanAgent {
             match self.run_once(input.clone()).await {
                 Ok(plan) => return Ok(plan),
                 Err(PlanError::Parse(msg)) => {
-                    eprintln!(
+                    elog!(
                         "[plan] parse failed (attempt {}/{}): {}",
                         attempt, max_attempts, msg
                     );

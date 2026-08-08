@@ -27,6 +27,7 @@ use crate::agent::{Agent, sealed};
 use crate::domain::{
     Assertion, Feedback, Finding, Implementation, Judgment, Plan, Review, Severity, TaskId,
 };
+use crate::elog;
 use crate::receipt::{ImplementMetrics, Receipts, ReviewSummary};
 
 #[derive(Debug, Error)]
@@ -148,10 +149,33 @@ pub struct LlmJudgeConfig {
     /// propagate immediately.
     #[serde(default = "default_llm_max_retries")]
     pub max_retries: u32,
+    /// Per-attempt wall-clock timeout for the spawned Judge subprocess
+    /// (`claude --dangerously-skip-permissions -p --model …`). If the
+    /// subprocess doesn't exit within this many seconds, the Judge call
+    /// returns `JudgeError::Llm` with a timeout message and the
+    /// orchestrator's outer retry loop catches it.
+    ///
+    /// **Why this matters (SPEC §12 item 8):** before this field existed,
+    /// the Judge subprocess had no timeout. On a heavy Judge prompt
+    /// (large `files` section, long Review findings), Claude Code Opus
+    /// could exceed any reasonable wall-clock expectation, leaving
+    /// `judge.run(ctx).await` awaiting forever. The orchestrator would
+    /// then be killed by upstream SIGPIPE (from the wrapping agent's
+    /// tee/pipe), causing receipts.json + .alps-last-done to never land
+    /// even though the deliverable was real. The 600s default is
+    /// generous enough for Opus on realistic Judge prompts (~50KB) and
+    /// tight enough that a hung subprocess doesn't block the smoke
+    /// indefinitely.
+    #[serde(default = "default_judge_timeout_secs")]
+    pub judge_timeout_secs: u64,
 }
 
 fn default_llm_max_retries() -> u32 {
     3
+}
+
+fn default_judge_timeout_secs() -> u64 {
+    600
 }
 
 impl Default for LlmJudgeConfig {
@@ -162,6 +186,7 @@ impl Default for LlmJudgeConfig {
             max_file_bytes: 50_000,
             max_total_bytes: 500_000,
             max_retries: default_llm_max_retries(),
+            judge_timeout_secs: default_judge_timeout_secs(),
         }
     }
 }
@@ -244,7 +269,7 @@ impl LlmJudge for HermesLlmJudge {
             match self.judge_once(ctx).await {
                 Ok(j) => return Ok(j),
                 Err(JudgeError::Parse(msg)) => {
-                    eprintln!(
+                    elog!(
                         "[judge] parse failed (attempt {}/{}): {}",
                         attempt, max_attempts, msg
                     );
@@ -303,6 +328,11 @@ impl HermesLlmJudge {
             .spawn()
             .map_err(|e| JudgeError::Llm(format!("spawn failed: {}", e)))?;
 
+        // Capture the child PID up-front so we can kill it if the timeout
+        // fires (otherwise `child.wait_with_output()` consumes `child` and we
+        // have no handle left to kill).
+        let child_pid = child.id();
+
         let mut stdin = child
             .stdin
             .take()
@@ -313,10 +343,27 @@ impl HermesLlmJudge {
             .map_err(|e| JudgeError::Llm(format!("stdin write failed: {}", e)))?;
         drop(stdin);
 
-        let output = child
-            .wait_with_output()
-            .await
-            .map_err(|e| JudgeError::Llm(format!("wait failed: {}", e)))?;
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(self.config.judge_timeout_secs),
+            child.wait_with_output(),
+        )
+        .await
+        .map_err(|_| {
+            // Timeout fired. Best-effort kill by PID so the subprocess doesn't
+            // linger holding stdout/stderr handles. If the PID is None (already
+            // reaped) or the kill itself fails, we still return the timeout
+            // error because that's what the caller asked for.
+            if let Some(pid) = child_pid {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .output();
+            }
+            JudgeError::Llm(format!(
+                "judge subprocess timed out after {}s (model={})",
+                self.config.judge_timeout_secs, self.config.model
+            ))
+        })?
+        .map_err(|e| JudgeError::Llm(format!("wait failed: {}", e)))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -774,23 +821,23 @@ impl StructuredJudge for DoDRunner {
         };
 
         let project_type = detect_project_type(detect_root);
-        eprintln!("[judge:structured] detected project type: {}", project_type);
+        elog!("[judge:structured] detected project type: {}", project_type);
 
         if matches!(project_type, ProjectType::Unknown) {
-            eprintln!("[judge:structured] no project type detected, skipping DoD checks");
+            elog!("[judge:structured] no project type detected, skipping DoD checks");
             return Ok(StructuredResult { all_pass: true, failed: vec![] });
         }
 
         let (cmd, args) = test_command_for(&project_type);
-        eprintln!("[judge:structured] running: {} {}", cmd, args.join(" "));
+        elog!("[judge:structured] running: {} {}", cmd, args.join(" "));
 
         let result = run_cmd_with_timeout(detect_root, cmd, &args, self.config.timeout_secs).await?;
 
         if result.success {
-            eprintln!("[judge:structured] PASS");
+            elog!("[judge:structured] PASS");
             Ok(StructuredResult { all_pass: true, failed: vec![] })
         } else {
-            eprintln!(
+            elog!(
                 "[judge:structured] FAIL (exit {:?})",
                 result.exit_code
             );
@@ -1602,6 +1649,157 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry with max_retries=1");
     }
-}
+
+    // ─────────────────────────────────────────────────────────────
+        // Judge subprocess timeout tests (SPEC §12 item 8)
+        // ─────────────────────────────────────────────────────────────
+        //
+        // Before this field existed (commit `6c391d8` and earlier), the
+        // Judge subprocess had no wall-clock timeout. On a heavy Judge
+        // prompt (large `files` section, long Review findings), Claude Code
+        // Opus could exceed any reasonable wall-clock expectation, leaving
+        // `judge.run(ctx).await` awaiting forever. The orchestrator would
+        // then be killed by upstream SIGPIPE (from the wrapping agent's
+        // tee/pipe), causing receipts.json + .alps-last-done to never land
+        // even though the deliverable was real. This block pins the fix.
+        //
+        // We bypass the `for_test` handler to actually spawn a subprocess.
+        // `cli_path` points to a tiny bash script that ignores all flags
+        // and runs `sleep 86400` (hangs forever). Without the fix the
+        // Judge call would block for 86400s; with the fix it returns in
+        // `judge_timeout_secs`.
+
+        /// Write a hang-helper script to a tempdir and return its path.
+        /// The script ignores all CLI flags (so it survives the Judge's
+        /// `--dangerously-skip-permissions -p --model <value>` invocation)
+        /// and exec's `sleep 86400` to hang forever.
+        fn write_hang_helper() -> std::path::PathBuf {
+            let dir = std::env::temp_dir().join(format!(
+                "alps-judge-timeout-test-{}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).expect("tempdir should be creatable");
+            let script = dir.join("hang.sh");
+            std::fs::write(
+                &script,
+                "#!/bin/bash\n\
+                 # Test helper: ignore all flags, hang forever.\n\
+                 while [[ $# -gt 0 ]]; do shift; done\n\
+                 exec sleep 86400\n",
+            )
+            .expect("write hang script");
+            std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .expect("chmod hang script");
+            script
+        }
+
+        fn hang_subprocess_config(timeout_secs: u64) -> (LlmJudgeConfig, std::path::PathBuf) {
+            let script = write_hang_helper();
+            let config = LlmJudgeConfig {
+                cli_path: script.to_string_lossy().to_string(),
+                // model is passed as `--model {model}` — anything works
+                // since the helper script ignores it.
+                model: "unused".to_string(),
+                judge_timeout_secs: timeout_secs,
+                ..LlmJudgeConfig::default()
+            };
+            (config, script)
+        }
+
+        #[tokio::test]
+        async fn judge_subprocess_timeout_fires_when_hung() {
+            let (config, script) = hang_subprocess_config(1);
+
+            let judge = HermesLlmJudge {
+                config,
+                test_handler: None, // <-- bypass for_test, actually spawn subprocess
+            };
+
+            let start = std::time::Instant::now();
+            let result = judge.judge(&dummy_ctx()).await;
+            let elapsed = start.elapsed();
+
+            let err = result.expect_err("hung subprocess should time out, not succeed");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("timed out after 1s"),
+                "expected 'timed out after 1s' in error, got: {}",
+                msg
+            );
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "timeout should fire in ~1s, took {:?}",
+                elapsed
+            );
+
+            // Clean up the helper script's parent dir.
+            let _ = std::fs::remove_dir_all(script.parent().unwrap());
+        }
+
+        #[tokio::test]
+        async fn judge_subprocess_timeout_default_is_sensible() {
+            // Default timeout should be large enough to accommodate realistic
+            // Opus Judge calls on 50KB+ prompts, but small enough that a hung
+            // subprocess doesn't block a smoke indefinitely. 600s (10 min) is
+            // the documented default (SPEC §12 item 8). If anyone changes
+            // this, this test makes the change intentional.
+            assert_eq!(
+                LlmJudgeConfig::default().judge_timeout_secs,
+                600,
+                "default judge_timeout_secs must stay at 600s unless SPEC §12 item 8 is revisited"
+            );
+        }
+
+        #[tokio::test]
+        async fn judge_subprocess_killed_after_timeout() {
+            // After the timeout fires, the subprocess should be killed
+            // (not left holding stdout/stderr handles). We snapshot the
+            // baseline PID count of hang-helper processes before the test,
+            // then assert no new ones are left running after the test.
+            let (config, script) = hang_subprocess_config(1);
+
+            let baseline = std::process::Command::new("pgrep")
+                .args(["-f", &script.to_string_lossy()])
+                .output()
+                .expect("pgrep should run")
+                .stdout;
+            let baseline_pids: std::collections::HashSet<u32> = String::from_utf8_lossy(&baseline)
+                .lines()
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+
+            let judge = HermesLlmJudge {
+                config,
+                test_handler: None,
+            };
+            let _ = judge.judge(&dummy_ctx()).await;
+
+            // Give the kill -9 a moment to take effect.
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            let after = std::process::Command::new("pgrep")
+                .args(["-f", &script.to_string_lossy()])
+                .output()
+                .expect("pgrep should run")
+                .stdout;
+            let after_pids: std::collections::HashSet<u32> = String::from_utf8_lossy(&after)
+                .lines()
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+
+            // Any new hang-helper processes that appeared during our test
+            // and are still running means we leaked a subprocess.
+            let leaked: Vec<_> = after_pids.difference(&baseline_pids).collect();
+            assert!(
+                leaked.is_empty(),
+                "leaked {} hang-helper subprocess(es) after timeout: {:?}",
+                leaked.len(),
+                leaked
+            );
+
+            // Clean up.
+            let _ = std::fs::remove_dir_all(script.parent().unwrap());
+        }
+    }
 
 use std::sync::Arc;

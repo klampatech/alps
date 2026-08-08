@@ -24,6 +24,7 @@ use crate::plan::PlanAgent;
 use crate::review::{ReviewAgent, ReviewContext};
 use crate::task::*;
 use crate::{agents_md, domain::Prompt};
+use crate::elog;
 
 /// Drive the outer loop until Judge passes.
 ///
@@ -62,7 +63,7 @@ fn run_iteration<'a>(
             )))?;
 
         // ── Plan ──
-        eprintln!("[plan] running");
+        elog!("[plan] running");
         // Wrap the prompt with the AGENTS.md content so plan-on-retry knows
         // what the implementer and reviewer already discovered.
         let plan_prompt = wrap_prompt_with_agents_md(&task.prompt, &agents_md_content);
@@ -72,11 +73,49 @@ fn run_iteration<'a>(
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
 
         // ── Implement ──
-        eprintln!("[implement] running");
+        elog!("[implement] running");
+        eprintln!("[alps-diag] run_iteration: calling implement.run");
         let impl_out = implement.run(task.state.plan.clone()).await
             .map_err(|e| AlpsError::Implement(Box::new(e)))?;
+        eprintln!("[alps-diag] run_iteration: implement.run returned, impl_out.metrics={:?}", impl_out.metrics);
         let task = task.implement(impl_out);
+        eprintln!("[alps-diag] run_iteration: task.implement done, calling persist_task");
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
+        eprintln!("[alps-diag] run_iteration: persist_task done");
+
+        // ── Implement-completion guard (SPEC §12 item 9) ──
+        // The orchestrator MUST NOT trust Ralph's `.ralph-result.json`
+        // `completed: true` claim at face value. Codex (and other Ralph
+        // backends) can emit "completed all tasks!" even when prd.json
+        // shows fewer stories passing than the plan called for —
+        // typically after a transient error like a tool-router JSON-RPC
+        // parse error mid-iteration. The Tier 4 smoke #2 (2026-08-04,
+        // herdr pane wB1:p1) burned this way: codex completed 3/9
+        // stories, falsely reported "iteration 4 of 20 completed",
+        // and the orchestrator dutifully proceeded to Review with a
+        // 3/9 deliverable. Review and Judge would have produced a
+        // look-good receipts.json masking a phantom-green run.
+        //
+        // The guard: if Ralph claimed completion but prd.json disagrees,
+        // fail loudly with `ImplementError::IncompleteStories` so the
+        // CLI exits non-zero and the operator sees the discrepancy.
+        let m = &task.state.implementation.metrics;
+        eprintln!(
+            "[alps-diag] run_iteration: implement-completion guard check: stories_passed={}, stories_total={}",
+            m.stories_passed, m.stories_total
+        );
+        if m.stories_passed != m.stories_total {
+            eprintln!(
+                "[alps-diag] run_iteration: implement-completion guard FAILED — returning ImplementError::IncompleteStories"
+            );
+            return Err(AlpsError::Implement(Box::new(
+                crate::implement::ImplementError::IncompleteStories {
+                    passed: m.stories_passed,
+                    total: m.stories_total,
+                },
+            )));
+        }
+        eprintln!("[alps-diag] run_iteration: implement-completion guard PASSED");
 
         // ── AGENTS.md: extract patterns from ralph's progress.txt ──
         // Ralph writes `## Codebase Patterns` to progress.txt as it discovers
@@ -94,7 +133,7 @@ fn run_iteration<'a>(
             )))?;
 
         // ── Review ──
-        eprintln!("[review] running");
+        elog!("[review] running");
         let review_ctx = ReviewContext {
             plan: task.state.plan.clone(),
             implementation: task.state.implementation.clone(),
@@ -106,7 +145,7 @@ fn run_iteration<'a>(
         persist_task(&task, workspace).map_err(AlpsError::Persistence)?;
 
         // ── Judge ──
-        eprintln!("[judge] running");
+        elog!("[judge] running");
         let ctx = JudgeContext {
             task_id: task.id.clone(),
             plan: task.state.plan.clone(),
@@ -120,13 +159,13 @@ fn run_iteration<'a>(
         match task.judge(judgment) {
             Ok(done) => {
                 persist_task(&done, workspace).map_err(AlpsError::Persistence)?;
-                eprintln!("[done] accepted");
+                elog!("[done] accepted");
                 Ok(done)
             }
             Err(rejected) => {
                 persist_task(&rejected, workspace).map_err(AlpsError::Persistence)?;
                 let reason = rejected.state.feedback.reason.clone();
-                eprintln!("[rejected] {} — restarting with feedback", reason);
+                elog!("[rejected] {} — restarting with feedback", reason);
                 let next = rejected.reset(vec![]);
                 run_iteration(next, plan, implement, review, judge, workspace).await
             }
@@ -269,6 +308,7 @@ mod tests {
     use crate::plan::PlanAgent;
     use crate::receipt::{ImplementMetrics, Receipts, ReviewSummary};
     use crate::review::{ReviewAgent, ReviewContext};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     /// A canned Plan that matches a "build a Python function" prompt.
@@ -781,5 +821,99 @@ mod tests {
             AlpsError::Judge(_) => {} // expected
             other => panic!("expected AlpsError::Judge, got: {:?}", other),
         }
+    }
+
+    /// SPEC §12 item 9: implement-completion guard.
+    ///
+    /// If the implement agent returns a `Implementation` where
+    /// `metrics.stories_passed != metrics.stories_total`, the orchestrator
+    /// MUST refuse to proceed to Review. This is the Tier 4 smoke #2 bug
+    /// (2026-08-04, herdr pane wB1:p1): codex hit a tool-router JSON-RPC
+    /// parse error mid-iteration, falsely emitted `Ralph completed all
+    /// tasks!`, wrote `completed: true` to `.ralph-result.json`, but
+    /// prd.json showed 3/9 stories passing. Without this guard the
+    /// orchestrator would proceed to Review and Judge with a 3/9
+    /// deliverable and produce a phantom-green receipts.json.
+    #[tokio::test]
+    async fn drive_returns_error_when_implement_completes_with_less_than_all_stories_passing() {
+        let (task, workspace, workspace_root, task_id) = fresh_workspace_task();
+
+        let plan = PlanAgent::for_test(|_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            Ok(canned_plan(PlanId(uuid::Uuid::new_v4())))
+        });
+
+        // Canned implementation: 3 of 9 stories passing, just like the
+        // Tier 4 smoke #2 burn. The implement-complete guard should
+        // catch this and refuse to proceed to Review.
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            let mut impl_ = canned_implementation(prd_path.clone());
+            impl_.metrics.stories_passed = 3;
+            impl_.metrics.stories_total = 9;
+            Ok(impl_)
+        });
+
+        // Review must NOT be called. If the guard is wired correctly, the
+        // loop short-circuits at the implement step. We use a tracking
+        // counter to prove Review never runs.
+        let review_calls = Arc::new(AtomicUsize::new(0));
+        let review_calls_for_closure = review_calls.clone();
+        let review = ReviewAgent::for_test(move |_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            review_calls_for_closure.fetch_add(1, Ordering::SeqCst);
+            Ok(canned_review())
+        });
+
+        // Judge: scripted to return Pass. Should never be invoked because
+        // the implement-completion guard fires before Judge runs.
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id: PlanId(uuid::Uuid::new_v4()),
+            plan_summary: "Build the requested Python function".to_string(),
+            implement_metrics: ImplementMetrics {
+                stories_passed: 3,
+                stories_total: 9,
+                iterations: 0,
+                elapsed_secs: 0,
+            },
+            review_summary: ReviewSummary {
+                findings_count: 1,
+                critical_findings: 0,
+                assertions_passed: 1,
+                assertions_total: 1,
+            },
+            judged_at: chrono::Utc::now(),
+            judge_model: "test".to_string(),
+        };
+        let scripted_judge = Arc::new(ScriptedLlmJudge::new(vec![Judgment::Pass(pass_receipts)]));
+        let judge = JudgeAgent::new(Arc::new(AlwaysPassStructured), scripted_judge.clone());
+
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+        let _ = std::fs::remove_dir_all(&workspace_root);
+
+        let err = match result {
+            Ok(_) => panic!("drive() should return Err when implement completes with 3/9 stories"),
+            Err(e) => e,
+        };
+        match err {
+            AlpsError::Implement(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("3/9") && msg.contains("incomplete"),
+                    "expected error to mention 3/9 stories and 'incomplete', got: {}",
+                    msg
+                );
+            }
+            other => panic!("expected AlpsError::Implement(IncompleteStories), got: {:?}", other),
+        }
+        assert_eq!(
+            review_calls.load(Ordering::SeqCst),
+            0,
+            "Review MUST NOT run when the implement-completion guard fires"
+        );
+        assert_eq!(
+            scripted_judge.call_count(),
+            0,
+            "Judge MUST NOT run when the implement-completion guard fires"
+        );
     }
 }

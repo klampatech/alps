@@ -82,6 +82,45 @@ write_ralph_result() {
   fi
 }
 
+# Returns 0 (true) if every userStory in the prd has passes=true.
+# Returns 1 (false) if any story is missing the passes field, has
+# passes=false, or the prd is unreadable / has no userStories.
+#
+# This is the ralph-side equivalent of alps's §12 item 9
+# ImplementError::IncompleteStories guard. The two together prevent
+# codex from claiming "<promise>COMPLETE</promise>" while leaving
+# stories unfinished.
+all_stories_pass() {
+  local prd="$1"
+  if [[ ! -f "$prd" ]]; then
+    return 1
+  fi
+  if ! command -v jq >/dev/null 2>&1; then
+    # Without jq we can't be sure. Fail open (return 0) so we don't
+    # accidentally block the orchestrator; alps's own guard will still
+    # catch a phantom-completed run.
+    return 0
+  fi
+  local total incomplete
+  total=$(jq -r '.userStories | length' "$prd" 2>/dev/null || echo 0)
+  if [[ "$total" == "0" ]]; then
+    return 1
+  fi
+  incomplete=$(jq -r '[.userStories[] | select(.passes != true)] | length' "$prd" 2>/dev/null || echo "$total")
+  [[ "$incomplete" == "0" ]]
+}
+
+# Echoes the count of stories still failing (passes != true) in the prd.
+# Used for the "N stories still failing" diagnostic message.
+remaining_stories() {
+  local prd="$1"
+  if [[ ! -f "$prd" ]] || ! command -v jq >/dev/null 2>&1; then
+    echo "?"
+    return
+  fi
+  jq -r '[.userStories[] | select(.passes != true)] | length' "$prd" 2>/dev/null || echo "?"
+}
+
 # Archive previous run if branch changed
 if [ -f "$PRD_FILE" ] && [ -f "$LAST_BRANCH_FILE" ]; then
   CURRENT_BRANCH=$(jq -r '.branchName // empty' "$PRD_FILE" 2>/dev/null || echo "")
@@ -132,11 +171,26 @@ for i in $(seq 1 $MAX_ITERATIONS); do
   echo "==============================================================="
 
   # Run the selected tool with the ralph prompt
+  #
+  # IMPORTANT: all three tee invocations use `tee -a /dev/stderr` (append mode).
+  # Without `-a`, tee opens the destination file with O_WRONLY|O_CREAT|O_TRUNC
+  # by default, which TRUNCATES the file to zero on every invocation. When the
+  # orchestrator's stderr (FD 2) is redirected to the same file (e.g. via a
+  # smoke-test wrapper's `2> file`), the orchestrator's earlier `elog!` writes
+  # (which use O_APPEND) get clobbered by tee's truncation. The orchestrator's
+  # O_APPEND writes then go to the new "end of file" (byte 0 after truncate),
+  # but `tee` is also writing from byte 0 with O_WRONLY, so the streams
+  # interleave destructively.
+  #
+  # With `tee -a`, tee opens the file with O_APPEND. Both writers (orchestrator
+  # + tee) atomically append to the end of the file, so neither clobbers the
+  # other. This is what unblocks smoke-style stderr capture for the operator
+  # pattern `exec alps run ... 2> file`.
   if [[ "$TOOL" == "amp" ]]; then
-    OUTPUT=$(cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(cat "$SCRIPT_DIR/prompt.md" | amp --dangerously-allow-all 2>&1 | tee -a /dev/stderr) || true
   elif [[ "$TOOL" == "claude" ]]; then
     # Claude Code: use --dangerously-skip-permissions for autonomous operation, --print for output
-    OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(claude --dangerously-skip-permissions --print < "$SCRIPT_DIR/CLAUDE.md" 2>&1 | tee -a /dev/stderr) || true
   else
     # Codex: --dangerously-bypass-approvals-and-sandbox = full autonomous mode.
     # The implement agent invokes ralph.sh with current_dir = the ralph workspace
@@ -150,28 +204,70 @@ for i in $(seq 1 $MAX_ITERATIONS); do
       RALPH_AGENTS="$SCRIPT_DIR/AGENTS.md"
     fi
     rm -f "$CODEX_LAST_MESSAGE"
-    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -o "$CODEX_LAST_MESSAGE" < "$RALPH_AGENTS" 2>&1 | tee /dev/stderr) || true
+    OUTPUT=$(codex exec --dangerously-bypass-approvals-and-sandbox -o "$CODEX_LAST_MESSAGE" < "$RALPH_AGENTS" 2>&1 | tee -a /dev/stderr) || true
   fi
 
   # Check for completion signal
-  # For codex: grep the final-message file (avoids prompt-text false-positive).
-  # For claude/amp: grep the streaming output (their --print mode doesn't echo the prompt).
+  #
+  # The original implementation (PR #6 era) just grepped for the literal
+  # string "<promise>COMPLETE</promise>" in the codex final message. That
+  # false-positives when codex writes prose denying completion — e.g.
+  #
+  #   "10 stories still incomplete (US-003 through US-012), so no
+  #   `<promise>COMPLETE</promise>` is emitted."
+  #
+  # The literal string IS in the file (in a denial), grep -q matches, and
+  # ralph.sh writes `completed: true` to .ralph-result.json. The alps
+  # orchestrator's §12 item 9 guard (ImplementError::IncompleteStories)
+  # catches this on the alps side, but the ralph result file already lies.
+  #
+  # The fix: after a positive grep, verify prd.json shows all stories
+  # passing. This is the ralph-side equivalent of the alps §12 item 9
+  # guard. If prd.json disagrees, treat the iteration as incomplete and
+  # continue (don't exit 0, don't write completed=true).
+  #
+  # For non-codex tools (claude/amp), the same fix applies: cross-check
+  # the prd before treating the grep as a real completion.
+  #
+  # Surfaced by smoke #8 (2026-08-06): 12-story run hit the bug at
+  # iteration 2 of 20 — codex wrote a denial, grep matched, ralph.sh
+  # claimed completed=true with 10/12 stories still failing.
   if [[ "$TOOL" == "codex" && -f "$CODEX_LAST_MESSAGE" ]]; then
     if grep -q "<promise>COMPLETE</promise>" "$CODEX_LAST_MESSAGE"; then
+      # Verify prd.json: only treat as completed if all stories pass.
+      if all_stories_pass "$PRD_FILE"; then
+        echo ""
+        echo "Ralph completed all tasks!"
+        echo "Completed at iteration $i of $MAX_ITERATIONS"
+        RALPH_COMPLETED=true
+        write_ralph_result
+        exit 0
+      else
+        # False positive: codex mentioned the string in prose but prd
+        # disagrees. Continue iterating; the next codex invocation will
+        # pick up the remaining stories.
+        #
+        # Avoid `local` here — this block is inside a for loop, not a
+        # function, so `local` errors with "can only be used in a function".
+        # The var name is unique enough not to collide.
+        remaining=$(remaining_stories "$PRD_FILE")
+        echo ""
+        echo "codex mentioned <promise>COMPLETE> in prose but $remaining stories still failing in prd.json. Continuing iteration."
+      fi
+    fi
+  elif echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
+    if all_stories_pass "$PRD_FILE"; then
       echo ""
       echo "Ralph completed all tasks!"
       echo "Completed at iteration $i of $MAX_ITERATIONS"
       RALPH_COMPLETED=true
       write_ralph_result
       exit 0
+    else
+      remaining=$(remaining_stories "$PRD_FILE")
+      echo ""
+      echo "tool mentioned <promise>COMPLETE> in prose but $remaining stories still failing in prd.json. Continuing iteration."
     fi
-  elif echo "$OUTPUT" | grep -q "<promise>COMPLETE</promise>"; then
-    echo ""
-    echo "Ralph completed all tasks!"
-    echo "Completed at iteration $i of $MAX_ITERATIONS"
-    RALPH_COMPLETED=true
-    write_ralph_result
-    exit 0
   fi
 
   echo "Iteration $i complete. Continuing..."
