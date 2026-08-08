@@ -236,9 +236,34 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
         // iteration. Same as bash `rm -f "$CODEX_LAST_MESSAGE"` line 206.
         let last_message_text: Option<String> = match cfg.tool {
             RalphTool::Codex => {
-                // `codex exec --dangerously-bypass-approvals-and-sandbox
-                // -o <last-message> < <prompt>`
+                // Spawn codex with stdin inheriting the prompt FILE.
+                //
+                // This mirrors the bash form `codex ... < "$RALPH_AGENTS"`
+                // (ralph.sh line 207): the child's stdin FD points at the
+                // prompt file and stays open until codex exits. Code reads
+                // the prompt via stdin.
+                //
+                // Earlier port used `Stdio::piped()` + `stdin.write_all(...)`
+                // + `drop(stdin)` to push the bytes then close the FD. That
+                // broke codex: its tool router detects a closed-stdin
+                // session at startup and refuses to run
+                // (`write_stdin failed: stdin is closed for this session;
+                // rerun exec_command with tty=true to keep stdin open`).
+                // The fix is to keep the FD open by inheriting it from the
+                // file, same as bash's `< file` shell redirect.
                 let _ = std::fs::remove_file(&codex_last_message);
+                let stdin_file = match std::fs::File::open(&codex_agents_prompt) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        elog!(
+                            "[ralph] failed to open prompt file {}: {} (continuing)",
+                            codex_agents_prompt.display(),
+                            e
+                        );
+                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
+                        continue;
+                    }
+                };
                 let output = Command::new("codex")
                     .args([
                         "exec",
@@ -246,7 +271,7 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                         "-o",
                         codex_last_message.to_str().unwrap(),
                     ])
-                    .stdin(Stdio::piped())
+                    .stdin(Stdio::from(stdin_file)) // <-- the fix: open FD, not piped
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn();
@@ -263,26 +288,9 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                     }
                 };
 
-                // Pipe the prompt via stdin (NOT argv — that's how smoke #18
-                // burned us). Read the prompt file's bytes, then write to
-                // stdin and close it.
-                let prompt_bytes = match std::fs::read(&codex_agents_prompt) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        elog!(
-                            "[ralph] failed to read prompt file {}: {} (continuing)",
-                            codex_agents_prompt.display(),
-                            e
-                        );
-                        let _ = child.kill().await;
-                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
-                        continue;
-                    }
-                };
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&prompt_bytes).await;
-                    drop(stdin); // EOF — codex will now start processing
-                }
+                // No stdin.write_all needed — the file FD is the child's
+                // stdin and codex reads from it directly (same as bash's
+                // `< "$RALPH_AGENTS"` redirect).
 
                 // ── FIX #6: O_APPEND stderr mirroring (bash: tee -a /dev/stderr) ──
                 //
@@ -340,9 +348,29 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
             }
             RalphTool::Claude => {
                 // `claude --dangerously-skip-permissions --print < <prompt>`
+                //
+                // Same stdin-via-File pattern as the codex branch — see
+                // the codex spawn comment above for the rationale. We
+                // learned the hard way that `Stdio::piped()` + `drop(stdin)`
+                // closes the FD and breaks tool routers (codex's tool
+                // router in particular refuses to run with a closed
+                // stdin session). Same fix applies pre-emptively to claude
+                // and amp so we don't repeat the smoke #19 regression.
+                let stdin_file = match std::fs::File::open(&claude_prompt) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        elog!(
+                            "[ralph] failed to open prompt file {}: {} (continuing)",
+                            claude_prompt.display(),
+                            e
+                        );
+                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
+                        continue;
+                    }
+                };
                 let output = Command::new("claude")
                     .args(["--dangerously-skip-permissions", "--print"])
-                    .stdin(Stdio::piped())
+                    .stdin(Stdio::from(stdin_file))
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn();
@@ -356,23 +384,8 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                     }
                 };
 
-                let prompt_bytes = match std::fs::read(&claude_prompt) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        elog!(
-                            "[ralph] failed to read prompt file {}: {} (continuing)",
-                            claude_prompt.display(),
-                            e
-                        );
-                        let _ = child.kill().await;
-                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
-                        continue;
-                    }
-                };
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&prompt_bytes).await;
-                    drop(stdin);
-                }
+                // No stdin.write_all needed — the file FD is the child's
+                // stdin. Claude reads from it directly.
 
                 // O_APPEND stderr mirroring (same as codex path)
                 let stderr_path = ralph_dir.join(".ralph-stderr.log");
@@ -409,9 +422,24 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
             }
             RalphTool::Amp => {
                 // `amp --dangerously-allow-all < <prompt>`
+                //
+                // Same stdin-via-File pattern as codex/claude — see the
+                // codex spawn comment for rationale.
+                let stdin_file = match std::fs::File::open(&amp_prompt) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        elog!(
+                            "[ralph] failed to open prompt file {}: {} (continuing)",
+                            amp_prompt.display(),
+                            e
+                        );
+                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
+                        continue;
+                    }
+                };
                 let output = Command::new("amp")
                     .arg("--dangerously-allow-all")
-                    .stdin(Stdio::piped())
+                    .stdin(Stdio::from(stdin_file))
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
                     .spawn();
@@ -425,23 +453,8 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                     }
                 };
 
-                let prompt_bytes = match std::fs::read(&amp_prompt) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        elog!(
-                            "[ralph] failed to read prompt file {}: {} (continuing)",
-                            amp_prompt.display(),
-                            e
-                        );
-                        let _ = child.kill().await;
-                        continue_ralph_iteration(cfg.tool, &ralph_dir).await;
-                        continue;
-                    }
-                };
-                if let Some(mut stdin) = child.stdin.take() {
-                    let _ = stdin.write_all(&prompt_bytes).await;
-                    drop(stdin);
-                }
+                // No stdin.write_all needed — the file FD is the child's
+                // stdin. Amp reads from it directly.
 
                 let stderr_path = ralph_dir.join(".ralph-stderr.log");
                 let mut stderr_file = match OpenOptions::new()
