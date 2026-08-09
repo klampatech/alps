@@ -14,9 +14,17 @@
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use alps_core::implement::{RalphResult, RalphTool};
 use alps_core::ralph::{self, RalphConfig};
+
+/// PATH is process-global. Every test in this integration-test binary routes
+/// Ralph to a different fake `codex`, so serialize the env mutation + run.
+/// Without this lock, `cargo test --all-targets` can launch the real codex or
+/// another test's fake binary (the old "unique fake_bin makes it safe" comment
+/// was wrong).
+static PATH_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
 
 // ─────────────────────────────────────────────────────────────────────
 // Helpers
@@ -24,11 +32,7 @@ use alps_core::ralph::{self, RalphConfig};
 
 /// Create a temp directory under /tmp with the given prefix.
 fn mktemp_dir(prefix: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "{}-{}",
-        prefix,
-        uuid::Uuid::new_v4().simple()
-    ));
+    let dir = std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&dir).expect("mktemp dir");
     dir
 }
@@ -86,8 +90,7 @@ fi
 exit 0
 "#;
     fs::write(&codex, script).expect("write fake codex");
-    fs::set_permissions(&codex, PermissionsExt::from_mode(0o755))
-        .expect("chmod fake codex");
+    fs::set_permissions(&codex, PermissionsExt::from_mode(0o755)).expect("chmod fake codex");
 }
 
 /// Build a fake `codex` that emits the literal COMPLETE string in a
@@ -111,8 +114,34 @@ fi
 exit 0
 "#;
     fs::write(&codex, script).expect("write fake codex with denial");
+    fs::set_permissions(&codex, PermissionsExt::from_mode(0o755)).expect("chmod fake codex");
+}
+
+/// Build a fake codex that records its working directory before completing.
+fn write_fake_codex_recording_cwd(bin_dir: &Path, cwd_log: &Path) {
+    let codex = bin_dir.join("codex");
+    let script = format!(
+        r#"#!/bin/bash
+last_message_file=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) last_message_file="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+pwd > "{}"
+cat > /dev/null
+echo "<promise>COMPLETE</promise>"
+if [[ -n "$last_message_file" ]]; then
+    echo "<promise>COMPLETE</promise>" > "$last_message_file"
+fi
+exit 0
+"#,
+        cwd_log.display()
+    );
+    fs::write(&codex, script).expect("write cwd-recording fake codex");
     fs::set_permissions(&codex, PermissionsExt::from_mode(0o755))
-        .expect("chmod fake codex");
+        .expect("chmod cwd-recording fake codex");
 }
 
 /// Run `ralph::run` with the given ralph_dir, script_dir, and a modified
@@ -123,16 +152,20 @@ async fn run_ralph_with_fake_codex(
     fake_bin: PathBuf,
     max_iterations: u32,
 ) -> RalphResult {
-    // Save and prepend PATH.
+    let _path_guard = PATH_LOCK
+        .get_or_init(|| tokio::sync::Mutex::new(()))
+        .lock()
+        .await;
+
+    // Save and prepend PATH. The process-global mutation is serialized by
+    // PATH_LOCK until Ralph finishes and PATH is restored.
     let prev_path = std::env::var("PATH").ok();
     let new_path = match &prev_path {
         Some(p) => format!("{}:{}", fake_bin.display(), p),
         None => fake_bin.display().to_string(),
     };
-    // SAFETY: env var mutation is a known race in cargo's parallel test
-    // harness. We accept it — each test in this binary uses its own
-    // unique fake_bin dir, and codex spawning happens synchronously
-    // before the env var is touched by another test.
+    // SAFETY: PATH mutation is process-global, so PATH_LOCK serializes all
+    // fake-codex Ralph runs in this integration-test binary.
     unsafe {
         std::env::set_var("PATH", &new_path);
     }
@@ -178,13 +211,8 @@ async fn state_files_live_in_ralph_dir_not_script_dir() {
     .expect("write AGENTS.md to ralph_dir");
     write_fake_codex(&fake_bin);
 
-    let result = run_ralph_with_fake_codex(
-        ralph_dir.clone(),
-        script_dir.clone(),
-        fake_bin.clone(),
-        5,
-    )
-    .await;
+    let result =
+        run_ralph_with_fake_codex(ralph_dir.clone(), script_dir.clone(), fake_bin.clone(), 5).await;
 
     // Ralph must claim completion (1-story prd, all passing, fake codex emits COMPLETE).
     assert!(
@@ -220,8 +248,8 @@ async fn state_files_live_in_ralph_dir_not_script_dir() {
     }
 
     // Validate .ralph-result.json shape.
-    let result_text = fs::read_to_string(ralph_dir.join(".ralph-result.json"))
-        .expect("read .ralph-result.json");
+    let result_text =
+        fs::read_to_string(ralph_dir.join(".ralph-result.json")).expect("read .ralph-result.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&result_text).expect("parse .ralph-result.json");
     assert_eq!(parsed["completed"], serde_json::json!(true));
@@ -254,13 +282,8 @@ async fn phantom_complete_in_prose_is_not_real_completion() {
     // Max-iter 3 so the test runs fast. After 3 iterations with no real
     // completion signal, Ralph writes .ralph-result.json with
     // completed=false.
-    let result = run_ralph_with_fake_codex(
-        ralph_dir.clone(),
-        script_dir.clone(),
-        fake_bin.clone(),
-        3,
-    )
-    .await;
+    let result =
+        run_ralph_with_fake_codex(ralph_dir.clone(), script_dir.clone(), fake_bin.clone(), 3).await;
 
     // The grep WOULD have matched the literal string (it's in the
     // denial text), but the cross-check guard MUST reject the claim
@@ -271,8 +294,8 @@ async fn phantom_complete_in_prose_is_not_real_completion() {
     );
 
     // Verify .ralph-result.json reflects the rejection.
-    let result_text = fs::read_to_string(ralph_dir.join(".ralph-result.json"))
-        .expect("read .ralph-result.json");
+    let result_text =
+        fs::read_to_string(ralph_dir.join(".ralph-result.json")).expect("read .ralph-result.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&result_text).expect("parse .ralph-result.json");
     assert_eq!(
@@ -311,19 +334,48 @@ async fn state_files_persist_across_iterations_via_progress_txt() {
     .expect("write AGENTS.md to ralph_dir");
     write_fake_codex(&fake_bin);
 
-    let _result = run_ralph_with_fake_codex(
-        ralph_dir.clone(),
-        script_dir.clone(),
-        fake_bin.clone(),
-        5,
-    )
-    .await;
+    let _result =
+        run_ralph_with_fake_codex(ralph_dir.clone(), script_dir.clone(), fake_bin.clone(), 5).await;
 
     let progress = fs::read_to_string(ralph_dir.join("progress.txt"))
         .expect("progress.txt exists in ralph_dir");
     assert!(
         progress.contains("Ralph Progress Log"),
         "progress.txt should be initialized with the standard header"
+    );
+
+    let _ = fs::remove_dir_all(&ralph_dir);
+    let _ = fs::remove_dir_all(&script_dir);
+    let _ = fs::remove_dir_all(&fake_bin);
+}
+
+/// Rust Ralph must launch its tool backend from `ralph_dir`, matching the
+/// shell path's `.current_dir(&ralph_dir)` contract and the vendored AGENTS.md
+/// instructions that say prd.json/progress.txt/.git are in CWD.
+#[tokio::test]
+async fn tool_backend_runs_with_ralph_dir_as_cwd() {
+    let ralph_dir = mktemp_dir("alps-ralph-test-tool-cwd");
+    let script_dir = mktemp_dir("alps-ralph-test-tool-cwd-script");
+    let fake_bin = mktemp_dir("alps-ralph-test-tool-cwd-bin");
+    let cwd_log = fake_bin.join("observed-cwd.txt");
+
+    write_one_story_passing_prd(&ralph_dir);
+    fs::write(
+        ralph_dir.join("AGENTS.md"),
+        "# Ralph agent instructions (fake, for tests)\n",
+    )
+    .expect("write AGENTS.md");
+    write_fake_codex_recording_cwd(&fake_bin, &cwd_log);
+
+    let result =
+        run_ralph_with_fake_codex(ralph_dir.clone(), script_dir.clone(), fake_bin.clone(), 1).await;
+
+    assert!(result.completed, "fixture should complete");
+    let observed = fs::read_to_string(&cwd_log).expect("fake codex recorded cwd");
+    assert_eq!(
+        PathBuf::from(observed.trim()),
+        ralph_dir,
+        "tool backend must run from ralph_dir so relative prd.json/progress.txt/.git access is stable"
     );
 
     let _ = fs::remove_dir_all(&ralph_dir);

@@ -137,7 +137,12 @@ impl RalphConfig {
     /// workspace is the per-task clone at `tasks/<id>/implementation/ralph/`.
     /// The script_dir is `alps/scripts/` where the vendored prompts
     /// (`AGENTS.md`, `CLAUDE.md`, `prompt.md`) live.
-    pub fn new(ralph_dir: PathBuf, script_dir: PathBuf, tool: RalphTool, max_iterations: u32) -> Self {
+    pub fn new(
+        ralph_dir: PathBuf,
+        script_dir: PathBuf,
+        tool: RalphTool,
+        max_iterations: u32,
+    ) -> Self {
         Self {
             ralph_dir,
             script_dir,
@@ -271,6 +276,7 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                         "-o",
                         codex_last_message.to_str().unwrap(),
                     ])
+                    .current_dir(&ralph_dir)
                     .stdin(Stdio::from(stdin_file)) // <-- the fix: open FD, not piped
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -370,6 +376,7 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                 };
                 let output = Command::new("claude")
                     .args(["--dangerously-skip-permissions", "--print"])
+                    .current_dir(&ralph_dir)
                     .stdin(Stdio::from(stdin_file))
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -439,6 +446,7 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                 };
                 let output = Command::new("amp")
                     .arg("--dangerously-allow-all")
+                    .current_dir(&ralph_dir)
                     .stdin(Stdio::from(stdin_file))
                     .stdout(Stdio::piped())
                     .stderr(Stdio::piped())
@@ -497,8 +505,9 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
         // so the prompt-text echo doesn't false-positive. For claude/amp,
         // we grep the captured stdout.
         let grep_hit = match cfg.tool {
-            RalphTool::Codex => codex_last_message.exists()
-                && grep_promise_complete(&codex_last_message),
+            RalphTool::Codex => {
+                codex_last_message.exists() && grep_promise_complete(&codex_last_message)
+            }
             _ => last_message_text
                 .as_deref()
                 .map(contains_promise_complete)
@@ -565,10 +574,7 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
 /// Always called on every exit path of the main loop, matching the bash
 /// `trap write_ralph_result EXIT` semantics (we just call it inline since
 /// Rust doesn't have signal-trap ergonomics).
-async fn write_result_file(
-    path: &Path,
-    result: &RalphResult,
-) -> Result<(), RalphError> {
+async fn write_result_file(path: &Path, result: &RalphResult) -> Result<(), RalphError> {
     let json = serde_json::to_string_pretty(result)?;
     tokio::fs::write(path, json).await?;
     Ok(())
@@ -607,8 +613,7 @@ async fn all_user_stories_pass(prd_file: &Path) -> bool {
         Ok(p) => p,
         Err(_) => return false,
     };
-    !prd.user_stories.is_empty()
-        && prd.user_stories.iter().all(|s| s.passes)
+    !prd.user_stories.is_empty() && prd.user_stories.iter().all(|s| s.passes)
 }
 
 /// Count of user stories still failing (`passes != true`) in prd.json.
@@ -622,7 +627,11 @@ async fn remaining_failing_stories(prd_file: &Path) -> String {
         Ok(p) => p,
         Err(_) => return "?".to_string(),
     };
-    prd.user_stories.iter().filter(|s| !s.passes).count().to_string()
+    prd.user_stories
+        .iter()
+        .filter(|s| !s.passes)
+        .count()
+        .to_string()
 }
 
 /// Archive the previous run if the branch changed. (bash lines 124-147)
@@ -667,11 +676,7 @@ async fn archive_previous_run_if_branch_changed(
         let _ = tokio::fs::copy(prd_file, archive_folder.join("prd.json")).await;
     }
     if progress_file.exists() {
-        let _ = tokio::fs::copy(
-            progress_file,
-            archive_folder.join("progress.txt"),
-        )
-        .await;
+        let _ = tokio::fs::copy(progress_file, archive_folder.join("progress.txt")).await;
     }
 
     // Reset progress file for new run
@@ -688,10 +693,7 @@ async fn archive_previous_run_if_branch_changed(
 }
 
 /// Write the current branch from prd.json to .last-branch. (bash lines 149-155)
-async fn track_current_branch(
-    prd_file: &Path,
-    last_branch_file: &Path,
-) -> Result<(), RalphError> {
+async fn track_current_branch(prd_file: &Path, last_branch_file: &Path) -> Result<(), RalphError> {
     if !prd_file.exists() {
         return Ok(());
     }
@@ -889,11 +891,8 @@ mod tests {
 
     /// Helper: make a temp dir under /tmp with the given prefix.
     fn tempdir_via_tmp(prefix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "{}-{}",
-            prefix,
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("{}-{}", prefix, uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }
