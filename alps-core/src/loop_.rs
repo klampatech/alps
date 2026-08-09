@@ -657,6 +657,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn drive_passes_first_try_writes_receipts_json_on_disk() {
+        // REPRO for SPEC §12 item 9.10 smoke #19 + #20 bug: `receipts.json`
+        // is missing from `tasks/<id>/receipts.json` after smoke runs even
+        // though the orchestrator logs `[done] accepted`. This test is the
+        // minimum repro — happy path, single Pass judgment — and asserts
+        // the file lands on disk.
+        //
+        // Intentionally does NOT call `remove_dir_all` on `workspace_root`
+        // so the file persists for inspection if the assertion fails.
+        let (task, workspace, workspace_root, task_id) = fresh_workspace_task();
+
+        let plan_id = PlanId(uuid::Uuid::new_v4());
+        let plan_id_for_closure = plan_id.clone();
+        let plan = PlanAgent::for_test(move |_input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            Ok(canned_plan(plan_id_for_closure.clone()))
+        });
+
+        let prd_path = workspace_root.join("prd.json");
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id,
+            plan_summary: "Build the requested Python function".to_string(),
+            implement_metrics: ImplementMetrics::default(),
+            review_summary: ReviewSummary {
+                findings_count: 1,
+                critical_findings: 0,
+                assertions_passed: 1,
+                assertions_total: 1,
+            },
+            judged_at: chrono::Utc::now(),
+            judge_model: "mock".to_string(),
+        };
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![Judgment::Pass(pass_receipts)]));
+        let judge = judge_agent_with(scripted.clone());
+
+        // ── Run ──
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+
+        // ── Assert 1: drive() returned Ok(done) ──
+        let done = result.expect("drive() should return Ok on first-try pass");
+
+        // ── Assert 2: receipts.json file exists on disk at workspace_root ──
+        let receipts_path = workspace.receipts_path();
+        let receipts_exists = receipts_path.exists();
+        let receipts_contents = if receipts_exists {
+            std::fs::read_to_string(&receipts_path).ok()
+        } else {
+            None
+        };
+        let _ = std::fs::remove_dir_all(&workspace_root);
+
+        assert!(
+            receipts_exists,
+            "receipts.json must exist on disk after drive() returns Ok(done). \
+             Expected path: {}. workspace_root contains: {:?}",
+            receipts_path.display(),
+            std::fs::read_dir(&workspace_root)
+                .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+                .unwrap_or_default(),
+        );
+
+        // ── Assert 3: file contents are valid JSON and contain the receipts ──
+        let contents = receipts_contents.expect("receipts.json must be readable");
+        let parsed: serde_json::Value = serde_json::from_str(&contents)
+            .expect("receipts.json must be valid JSON");
+        assert_eq!(
+            parsed["task_id"].as_str(),
+            Some(done.id.as_str()),
+            "receipts.json task_id must match the done task id"
+        );
+        assert_eq!(
+            parsed["judge_model"].as_str(),
+            Some("mock"),
+            "receipts.json judge_model must match the canned receipts"
+        );
+    }
+
+    #[tokio::test]
     async fn drive_passes_first_try_propagates_agents_md() {
         // ── Setup ──
         // Single happy-path iteration. The load-bearing contract for

@@ -112,6 +112,56 @@ impl Default for RalphTool {
     }
 }
 
+/// Portable ExitStatus-like enum that abstracts the Rust vs. Shell Ralph
+/// return signal.
+///
+/// The shell path returns a real `std::process::ExitStatus` from a
+/// subprocess. The Rust path doesn't have one — Ralph runs in-process and
+/// signals success via the `.ralph-result.json` `completed: bool` flag.
+/// This enum lets both paths plug into the same downstream
+/// `if !ralph_status.success() { ... }` branch without changes to the
+/// orchestrator's post-Ralph logic.
+#[derive(Debug, Clone, Copy)]
+enum RalphaStatusLike {
+    /// Ralph claims every story passed.
+    Success,
+    /// Ralph exited non-zero (shell) or hit max iterations (rust).
+    NonZero(i32),
+}
+
+impl RalphaStatusLike {
+    fn success(&self) -> bool {
+        matches!(self, RalphaStatusLike::Success)
+    }
+    fn code(&self) -> Option<i32> {
+        match self {
+            RalphaStatusLike::Success => Some(0),
+            RalphaStatusLike::NonZero(code) => Some(*code),
+        }
+    }
+}
+
+/// Which Ralph implementation to invoke from `ImplementAgent::run`.
+///
+/// The Rust mode (default) calls `alps_core::ralph::run` in-process —
+/// no subprocess, no argv-leak risk, no orchestrator-death window at the
+/// bash↔Rust IPC boundary. The shell mode is the legacy escape hatch:
+/// exec `scripts/ralph.sh` as a subprocess. Kept for one release so we can
+/// roll back without a redeploy if a regression slips through smoke #19.
+///
+/// The `Serialize`/`Deserialize` derives keep `RalphMode` in the persisted
+/// `implementation.json` schema without a breaking change — existing files
+/// deserialize as `Rust` (the default), which is what we want.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RalphMode {
+    /// Call `alps_core::ralph::run` in-process. Default.
+    #[default]
+    Rust,
+    /// Spawn `scripts/ralph.sh` as a subprocess. Legacy escape hatch.
+    Shell,
+}
+
 /// Config for the Implement agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementConfig {
@@ -139,6 +189,11 @@ pub struct ImplementConfig {
     /// The CLI replaces it before the agent runs.
     #[serde(default)]
     pub deliverable_path: PathBuf,
+
+    /// Which Ralph implementation to invoke. Default: `Rust`.
+    /// See [`RalphMode`] docs for rationale.
+    #[serde(default)]
+    pub ralph_mode: RalphMode,
 }
 
 fn default_agents_prompt_path() -> PathBuf {
@@ -155,6 +210,7 @@ impl Default for ImplementConfig {
             tool: RalphTool::default(),
             init_command: None,
             deliverable_path: PathBuf::new(),
+            ralph_mode: RalphMode::default(),
         }
     }
 }
@@ -335,32 +391,113 @@ venv/
         }
 
         // ── 8. Invoke Ralph ──
+        //
+        // Dispatch between Rust (default) and Shell (legacy escape hatch)
+        // implementations. The Rust path calls `alps_core::ralph::run`
+        // in-process — no subprocess, no argv leak, no orchestrator-death
+        // window at the bash↔Rust IPC boundary. The shell path preserves
+        // the original subprocess semantics for one release as a rollback
+        // safety net.
+        //
+        // Both paths write `.ralph-result.json` to `ralph_dir` on exit, so
+        // the `read_ralph_result` call below works regardless of mode.
         elog!(
-            "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}",
-            self.config.tool, self.config.max_iterations, prd.user_stories.len()
+            "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}, mode={:?}",
+            self.config.tool, self.config.max_iterations, prd.user_stories.len(),
+            self.config.ralph_mode
         );
         eprintln!(
-            "[alps-diag] implement.run: invoking ralph.sh (tool={}, max_iter={})",
-            self.config.tool, self.config.max_iterations
+            "[alps-diag] implement.run: invoking ralph (tool={}, max_iter={}, mode={:?})",
+            self.config.tool, self.config.max_iterations, self.config.ralph_mode
         );
-        let ralph_status = Command::new(&self.config.ralph_path)
-            .args([
-                "--tool", self.config.tool.as_str(),
-                &self.config.max_iterations.to_string(),
-            ])
-            .current_dir(&ralph_dir)
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .await
-            .map_err(|e| ImplementError::Ralph {
-                op: "spawn ralph".to_string(),
-                msg: e.to_string(),
-            })?;
+
+        // The downstream code treats `ralph_status` as `ExitStatus`-like
+        // (`.success()` + `.code()`). The shell path gives us a real
+        // ExitStatus. The Rust path doesn't exit — it writes
+        // `.ralph-result.json` with `completed: bool`, so we synthesize
+        // a synthetic status from that flag for backwards compat with the
+        // downstream `if !ralph_status.success() { ... }` branch.
+        let ralph_status: RalphaStatusLike = match self.config.ralph_mode {
+            RalphMode::Rust => {
+                // In-process Ralph. Build the config from the workspace
+                // state we just set up. The script_dir is the parent of
+                // ralph.sh (where the vendored AGENTS.md / CLAUDE.md live).
+                let script_dir = self
+                    .config
+                    .ralph_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| PathBuf::from("./scripts"));
+
+                let ralph_cfg = crate::ralph::RalphConfig::new(
+                    ralph_dir.clone(),
+                    script_dir,
+                    self.config.tool,
+                    self.config.max_iterations,
+                );
+
+                match crate::ralph::run(ralph_cfg).await {
+                    Ok(result) => {
+                        // Rust Ralph writes `.ralph-result.json` itself,
+                        // so we already have it. The shell path needs to
+                        // wait for the subprocess to write it (which the
+                        // `status().await` does by blocking).
+                        //
+                        // Synthesize an ExitStatus-like: completed=true
+                        // → success(), completed=false → non-success.
+                        if result.completed {
+                            RalphaStatusLike::Success
+                        } else {
+                            RalphaStatusLike::NonZero(1)
+                        }
+                    }
+                    Err(e) => {
+                        // In-process Ralph errored. This is structurally
+                        // different from "ralph ran but didn't complete" —
+                        // it's a setup/invariant failure. Surface it.
+                        return Err(ImplementError::Ralph {
+                            op: "rust ralph::run".to_string(),
+                            msg: e.to_string(),
+                        });
+                    }
+                }
+            }
+            RalphMode::Shell => {
+                // Legacy subprocess path. Preserved for one release as a
+                // rollback safety net — set `ralph_mode = Shell` to use it.
+                let status = Command::new(&self.config.ralph_path)
+                    .args([
+                        "--tool", self.config.tool.as_str(),
+                        &self.config.max_iterations.to_string(),
+                    ])
+                    .current_dir(&ralph_dir)
+                    .stdout(Stdio::inherit())
+                    .stderr(Stdio::inherit())
+                    .status()
+                    .await
+                    .map_err(|e| ImplementError::Ralph {
+                        op: "spawn ralph.sh".to_string(),
+                        msg: e.to_string(),
+                    })?;
+                eprintln!(
+                    "[alps-diag] implement.run: ralph.sh status() returned (success={}, code={:?})",
+                    status.success(),
+                    status.code()
+                );
+                if status.success() {
+                    RalphaStatusLike::Success
+                } else {
+                    RalphaStatusLike::NonZero(status.code().unwrap_or(1))
+                }
+            }
+        };
+
+        // ── 8b. Synthesize the post-Ralph ExitStatus for the downstream code ──
+        let ralph_exit_code: Option<i32> = ralph_status.code();
         eprintln!(
-            "[alps-diag] implement.run: ralph.sh status() returned (success={}, code={:?})",
+            "[alps-diag] implement.run: ralph status (synthesized for rust mode): success={}, code={:?}",
             ralph_status.success(),
-            ralph_status.code()
+            ralph_exit_code
         );
 
         // IMPORTANT: ralph hitting max-iterations is NOT a hard error.
@@ -452,26 +589,31 @@ venv/
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RalphPrd {
+pub(crate) struct RalphPrd {
     project: String,
     #[serde(rename = "branchName")]
-    branch_name: String,
+    pub(crate) branch_name: String,
+    #[serde(default)]
     description: String,
     #[serde(rename = "userStories")]
-    user_stories: Vec<RalphStory>,
+    pub(crate) user_stories: Vec<RalphStory>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RalphStory {
+pub(crate) struct RalphStory {
+    #[allow(dead_code)]
     id: String,
+    #[allow(dead_code)]
     title: String,
+    #[allow(dead_code)]
     description: String,
     #[serde(rename = "acceptanceCriteria")]
+    #[allow(dead_code)]
     acceptance_criteria: Vec<String>,
+    #[allow(dead_code)]
     #[serde(default)]
     priority: u32,
-    #[serde(default)]
-    passes: bool,
+    pub(crate) passes: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     notes: Option<String>,
 }
@@ -1217,6 +1359,10 @@ exit 1
                 tool: RalphTool::Codex,
                 init_command: None,
                 deliverable_path: workdir.join("implementation").join("ralph"),
+                // These tests use a fake ralph.sh that simulates subprocess
+                // semantics — exercise the Shell path explicitly so the
+                // Rust-vs-Shell dispatch is also covered.
+                ralph_mode: RalphMode::Shell,
             },
         );
 
@@ -1259,6 +1405,8 @@ exit 1
                 tool: RalphTool::Codex,
                 init_command: None,
                 deliverable_path: workdir.join("implementation").join("ralph"),
+                // Shell mode — see test above.
+                ralph_mode: RalphMode::Shell,
             },
         );
 
@@ -1294,6 +1442,8 @@ exit 1
                 tool: RalphTool::Codex,
                 init_command: None,
                 deliverable_path: workdir.join("implementation").join("ralph"),
+                // Shell mode — see test above.
+                ralph_mode: RalphMode::Shell,
             },
         );
 

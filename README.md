@@ -73,10 +73,10 @@ The key invariant: **the type system encodes the state machine.** Invalid transi
 
 ## Status
 
-**v0.7.3, 2026-08-07** — Iteration-2 orchestrator-death bug fixed + smoke wrapper dedup. **Two consecutive Tier-4 Judge ACCEPT verdicts** (smokes #17 + #18, full-stack notes app with FastAPI + Postgres + JWT + Vite + React + TS + Zustand, 8/8 and 7/7 stories respectively, 12/12 review assertions, opus-4 judge, opus-4 judge via MiniMax-M3 wiring). §12 items 9 + 9.5 + 9.6 + 9.7 + 9.8 + 10 closed. 156 tests passing (138 unit + 14 integration + 4 new bash tests for prompt substitution).
+**v0.7.5, 2026-08-08** — Iteration-3 ralph.sh → in-process Rust library port (§12 item 9.10). **Smoke #20 verified** the Rust Ralph end-to-end with 10 commits (US-001..US-009 + initial) and 17/17 Tier-4 artifacts shipped in 95:44 wall-clock, **0 SIGTERMs**, **0 panics**. Smoke #19 surfaced a stdin-closed regression (codex's tool router refuses closed-stdin sessions); fixed in commit `63b876a` by switching from `Stdio::piped() + write_all + drop` to `Stdio::from(File)` (mirrors bash's `< file` redirect). **Two consecutive Tier-4 Judge ACCEPT verdicts** (smokes #17 + #18, bash Ralph, full-stack notes app with FastAPI + Postgres + JWT + Vite + React + TS + Zustand, 8/8 and 7/7 stories respectively, 12/12 review assertions, opus-4 judge via MiniMax-M3 wiring). §12 items 9 + 9.5 + 9.6 + 9.7 + 9.8 + 10 closed. 168 tests passing (141 unit + 17 integration + 6 new bash tests for prompt substitution + 3 new ralph-state-location integration tests + 1 ignored doc-test). **Known follow-ups:** smoke #20 showed heavier outer-loop churn (~8 iters vs smoke #18's 3) and a `receipts.json` warning (same warning in smoke #19, pre-existing) — both tracked for follow-up PRs.
 
 - ✅ **Plan** → Claude Code (`--dangerously-bypass-approvals-and-sandbox -p`) with atomic stories + verifiable DoD
-- ✅ **Implement** → `ralph.sh --tool codex` subprocess, idempotent dir setup, per-task branch, real iteration metrics
+- ✅ **Implement** → `alps_core::ralph::run` in-process (Rust library, default `RalphMode::Rust`) with `RalphMode::Shell` → `scripts/ralph.sh` escape hatch kept for one release; idempotent dir setup, per-task branch, real iteration metrics. Operator-facing CLI: `alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/` (thin wrapper over the same library — no subprocess, no argv leak)
 - ✅ **Review** → Adversarial Claude with strict JSON output, file:line evidence required
 - ✅ **Judge** → Hybrid `DoDRunner` (cargo/pytest/npm/go test, 120s timeout) + `HermesLlmJudge` (Claude Code, default model `claude-opus-4` via the Opus alias → MiniMax-M3; was `claude-sonnet-4` prior to 2026-07-30 swap — see SPEC §11.1)
 - ✅ **Reject path** → Restarts at Plan with feedback appended (no feedback-loop loss)
@@ -128,10 +128,10 @@ That's the whole orchestrator. `loop_::drive` is a recursive function, not a `lo
 
 ### Compose boundary with Ralph
 
-ALPS owns the **outer** loop. Ralph owns the **inner** implement loop. ALPS treats Ralph as a black-box subprocess — it does **not** reimplement Ralph's loop logic:
+ALPS owns the **outer** loop. Ralph owns the **inner** implement loop. Since the iteration-3 ralph port (§12 item 9.10), Ralph is an **in-process Rust library** (`alps-core::ralph::run`), not a subprocess — the orchestrator hot path no longer crosses a bash↔Rust IPC boundary. The `alps ralph` CLI subcommand is a thin wrapper over the same library function (used by the operator workflow). The legacy `scripts/ralph.sh` is still around as `RalphMode::Shell` for one release as a rollback safety net.
 
 1. ALPS writes `prd.json` (1:1 mapping from `Plan.stories` to Ralph's `userStories` format) + `progress.txt` (with the `## Codebase Patterns` header) into `tasks/<id>/implementation/ralph/`.
-2. ALPS spawns `ralph.sh --tool codex <max_iterations>` with stdin/stdout inherited. Ralph runs its own loop.
+2. ALPS calls `alps_core::ralph::run(cfg: RalphConfig)` in-process (Rust library, default `RalphMode::Rust`). The same function is exposed to operators via the `alps ralph` CLI subcommand (`alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/`). `RalphMode::Shell` is the legacy escape hatch that exec's `scripts/ralph.sh` as a subprocess.
 3. Ralph exits when `<promise>COMPLETE</promise>` appears in `.codex-last-message.txt` (the Codex-specific completion extraction).
 4. ALPS reads back `prd.json` (stories now have `passes: true`), `progress.txt`, and `git log` → typed `Implementation`.
 

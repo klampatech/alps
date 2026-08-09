@@ -50,6 +50,7 @@ pub mod judge;
 pub mod loop_;
 pub mod persistence;
 pub mod plan;
+pub mod ralph;
 pub mod receipt;
 pub mod review;
 pub mod task;
