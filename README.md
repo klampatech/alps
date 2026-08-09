@@ -76,7 +76,7 @@ The key invariant: **the type system encodes the state machine.** Invalid transi
 **v0.7.5, 2026-08-08** — Iteration-3 ralph.sh → in-process Rust library port (§12 item 9.10). **Smoke #20 verified** the Rust Ralph end-to-end with 10 commits (US-001..US-009 + initial) and 17/17 Tier-4 artifacts shipped in 95:44 wall-clock, **0 SIGTERMs**, **0 panics**. Smoke #19 surfaced a stdin-closed regression (codex's tool router refuses closed-stdin sessions); fixed in commit `63b876a` by switching from `Stdio::piped() + write_all + drop` to `Stdio::from(File)` (mirrors bash's `< file` redirect). **Two consecutive Tier-4 Judge ACCEPT verdicts** (smokes #17 + #18, bash Ralph, full-stack notes app with FastAPI + Postgres + JWT + Vite + React + TS + Zustand, 8/8 and 7/7 stories respectively, 12/12 review assertions, opus-4 judge via MiniMax-M3 wiring). §12 items 9 + 9.5 + 9.6 + 9.7 + 9.8 + 10 closed. 168 tests passing (141 unit + 17 integration + 6 new bash tests for prompt substitution + 3 new ralph-state-location integration tests + 1 ignored doc-test). **Known follow-ups:** smoke #20 showed heavier outer-loop churn (~8 iters vs smoke #18's 3) and a `receipts.json` warning (same warning in smoke #19, pre-existing) — both tracked for follow-up PRs.
 
 - ✅ **Plan** → Claude Code (`--dangerously-bypass-approvals-and-sandbox -p`) with atomic stories + verifiable DoD
-- ✅ **Implement** → `alps_core::ralph::run` in-process (Rust library, default `RalphMode::Rust`) with `RalphMode::Shell` → `scripts/ralph.sh` escape hatch kept for one release; idempotent dir setup, per-task branch, real iteration metrics. Operator-facing CLI: `alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/` (thin wrapper over the same library — no subprocess, no argv leak)
+- ✅ **Implement** → `alps_core::ralph::run` in-process (Rust library, the only Ralph mode since the scripts/ralph.sh cleanup). Idempotent dir setup, per-task branch, real iteration metrics. Operator-facing CLI: `alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/` (thin wrapper over the same library — no subprocess, no argv leak)
 - ✅ **Review** → Adversarial Claude with strict JSON output, file:line evidence required
 - ✅ **Judge** → Hybrid `DoDRunner` (cargo/pytest/npm/go test, 120s timeout) + `HermesLlmJudge` (Claude Code, default model `claude-opus-4` via the Opus alias → MiniMax-M3; was `claude-sonnet-4` prior to 2026-07-30 swap — see SPEC §11.1)
 - ✅ **Reject path** → Restarts at Plan with feedback appended (no feedback-loop loss)
@@ -128,10 +128,10 @@ That's the whole orchestrator. `loop_::drive` is a recursive function, not a `lo
 
 ### Compose boundary with Ralph
 
-ALPS owns the **outer** loop. Ralph owns the **inner** implement loop. Since the iteration-3 ralph port (§12 item 9.10), Ralph is an **in-process Rust library** (`alps-core::ralph::run`), not a subprocess — the orchestrator hot path no longer crosses a bash↔Rust IPC boundary. The `alps ralph` CLI subcommand is a thin wrapper over the same library function (used by the operator workflow). The legacy `scripts/ralph.sh` is still around as `RalphMode::Shell` for one release as a rollback safety net.
+ALPS owns the **outer** loop. Ralph owns the **inner** implement loop. Ralph is an **in-process Rust library** (`alps-core::ralph::run`), not a subprocess — the orchestrator hot path no longer crosses a bash↔Rust IPC boundary. The `alps ralph` CLI subcommand is a thin wrapper over the same library function (used by the operator workflow). The legacy `scripts/ralph.sh` was removed after smoke #21 verified the Rust path under Tier-4 load.
 
 1. ALPS writes `prd.json` (1:1 mapping from `Plan.stories` to Ralph's `userStories` format) + `progress.txt` (with the `## Codebase Patterns` header) into `tasks/<id>/implementation/ralph/`.
-2. ALPS calls `alps_core::ralph::run(cfg: RalphConfig)` in-process (Rust library, default `RalphMode::Rust`). The same function is exposed to operators via the `alps ralph` CLI subcommand (`alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/`). `RalphMode::Shell` is the legacy escape hatch that exec's `scripts/ralph.sh` as a subprocess.
+2. ALPS calls `alps_core::ralph::run(cfg: RalphConfig)` in-process (Rust library, the only mode). The same function is exposed to operators via the `alps ralph` CLI subcommand (`alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/`).
 3. Ralph exits when `<promise>COMPLETE</promise>` appears in `.codex-last-message.txt` (the Codex-specific completion extraction).
 4. ALPS reads back `prd.json` (stories now have `passes: true`), `progress.txt`, and `git log` → typed `Implementation`.
 
@@ -366,7 +366,7 @@ sleep 6 && alps run "..." --workdir /tmp/alps-smoke
 
 3. **Implement** — `ImplementAgent`:
    - Writes `prd.json` (mapping `Plan.stories` → Ralph's `userStories` format) into `tasks/<id>/implementation/ralph/`.
-   - Spawns `scripts/ralph.sh --tool codex <max_iterations>` with the ralph dir as cwd.
+   - Calls `alps_core::ralph::run(RalphConfig)` in-process (Rust library, no subprocess).
    - Waits for `<promise>COMPLETE</promise>` in `.codex-last-message.txt` **or** max-iterations exit.
    - Reads back `prd.json` (regardless of exit code), `progress.txt`, `git log`.
    - Recursively walks `ralph_dir` for artifacts (with `SKIP_DIRS` for `target/`, `node_modules/`, `.git/`, `__pycache__/`, `.gradle/`, `.cargo/`, `dist/`, `build/`, `.pytest_cache/`, `.mypy_cache/`).
@@ -422,7 +422,7 @@ alps/                              # Cargo workspace
 │       ├── task.rs                # Type-state Task<S> + state structs + transitions
 │       ├── loop_.rs               # Outer loop driver — recursive, not loop{}
 │       ├── plan.rs                # PlanAgent — real claude -p invocation
-│       ├── implement.rs           # ImplementAgent — Ralph subprocess
+│   ├── implement.rs           # ImplementAgent — Ralph (in-process)
 │       ├── review.rs              # ReviewAgent — adversarial Claude with JSON schema
 │       ├── judge.rs               # JudgeAgent — hybrid (DoDRunner + HermesLlmJudge)
 │       ├── agents_md.rs           # Task-level AGENTS.md read/write/append + extract_patterns
@@ -435,8 +435,8 @@ alps/                              # Cargo workspace
 │       └── domain.rs              # Plan, Review, Implementation, Judgment, etc.
 ├── alps-cli/                      # Binary entry: `alps run "prompt"`
 │   └── src/main.rs                # clap CLI, call into alps-core::loop_
-├── scripts/                       # Vendored from snarktank/ralph
-│   ├── ralph.sh                   # Ralph loop runner (must be executable)
+├── scripts/                       # Vendored Ralph prompt templates
+│   ├── AGENTS.md                  # Ralph's Codex prompt (read by codex --AGENTS.md)
 │   └── CLAUDE.md                  # Ralph's Claude Code prompt
 └── tasks/                         # Per-task workspaces, git-committed per state
 ```
@@ -639,7 +639,7 @@ Architectural notes for new agents: see the **Compose boundary with Ralph** and 
 
 ALPS is built on the shoulders of:
 
-- [**Ralph**](https://github.com/snarktank/ralph) — the inner implement loop, vendored at `scripts/ralph.sh`
+- [**Ralph**](https://github.com/snarktank/ralph) — the inner implement loop, now in-process as `alps-core/src/ralph.rs` (the bash `scripts/ralph.sh` was removed after smoke #21 verified the Rust path under Tier-4 load)
 - [**Claude Code**](https://claude.ai/code) — Plan + Review agents
 - [**Codex CLI**](https://github.com/openai/codex) — Ralph's default execution backend
 - [**Hermes Agent**](https://hermes-agent.nousresearch.com/) — the LLM Judge backbone (Hybrid judge stage 2)

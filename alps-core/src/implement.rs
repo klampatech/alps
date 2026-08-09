@@ -1,11 +1,12 @@
-//! Implement agent — Ralph (Codex loop).
+//! Implement agent — Ralph (in-process CodeX / Claude / Amp loop).
 //!
-//! Consumes a `Plan`, produces an `Implementation`. ALPS treats Ralph as a
-//! black-box subprocess:
+//! Consumes a `Plan`, produces an `Implementation`. ALPS invokes Ralph via
+//! `alps_core::ralph::run` (an in-process Rust library function), so the
+//! orchestrator hot path no longer crosses a bash↔Rust IPC boundary.
 //!
 //! 1. Set up `tasks/<id>/implementation/ralph/` as Ralph's working directory
-//! 2. Initialize git, copy ralph.sh + CLAUDE.md, write prd.json + progress.txt
-//! 3. Run `ralph.sh --tool claude --max-iters N` (inherits stdout/stderr)
+//! 2. Initialize git, copy CLAUDE.md + AGENTS.md, write prd.json + progress.txt
+//! 3. Call `alps_core::ralph::run(ralph_cfg)` in-process
 //! 4. Read back prd.json (with passes:true), progress.txt, git log
 //! 5. Return typed `Implementation`
 //!
@@ -112,15 +113,11 @@ impl Default for RalphTool {
     }
 }
 
-/// Portable ExitStatus-like enum that abstracts the Rust vs. Shell Ralph
-/// return signal.
-///
-/// The shell path returns a real `std::process::ExitStatus` from a
-/// subprocess. The Rust path doesn't have one — Ralph runs in-process and
-/// signals success via the `.ralph-result.json` `completed: bool` flag.
-/// This enum lets both paths plug into the same downstream
-/// `if !ralph_status.success() { ... }` branch without changes to the
-/// orchestrator's post-Ralph logic.
+/// Portable ExitStatus-like enum that abstracts the Rust Ralph return
+/// signal. Kept as a separate type so the post-Ralph dispatch
+/// (`if !ralph_status.success() { ... }`) reads as a familiar ExitStatus
+/// shape even though Ralph is now in-process and signals success via the
+/// `.ralph-result.json` `completed: bool` flag.
 #[derive(Debug, Clone, Copy)]
 enum RalphaStatusLike {
     /// Ralph claims every story passed.
@@ -143,30 +140,27 @@ impl RalphaStatusLike {
 
 /// Which Ralph implementation to invoke from `ImplementAgent::run`.
 ///
-/// The Rust mode (default) calls `alps_core::ralph::run` in-process —
-/// no subprocess, no argv-leak risk, no orchestrator-death window at the
-/// bash↔Rust IPC boundary. The shell mode is the legacy escape hatch:
-/// exec `scripts/ralph.sh` as a subprocess. Kept for one release so we can
-/// roll back without a redeploy if a regression slips through smoke #19.
-///
-/// The `Serialize`/`Deserialize` derives keep `RalphMode` in the persisted
-/// `implementation.json` schema without a breaking change — existing files
-/// deserialize as `Rust` (the default), which is what we want.
+/// ALPS ralph is a single in-process Rust library (`alps_core::ralph::run`).
+/// The bash implementation (`scripts/ralph.sh`) was removed after smoke #21
+/// verified the Rust path end-to-end. The `Serialize`/`Deserialize` derives
+/// keep `RalphMode` in the persisted `implementation.json` schema without
+/// a breaking change — existing files deserialize as `Rust` (the default),
+/// which is the only valid value post-cleanup.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum RalphMode {
-    /// Call `alps_core::ralph::run` in-process. Default.
+    /// Call `alps_core::ralph::run` in-process. The only mode.
     #[default]
     Rust,
-    /// Spawn `scripts/ralph.sh` as a subprocess. Legacy escape hatch.
-    Shell,
 }
 
 /// Config for the Implement agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImplementConfig {
-    /// Path to the `ralph.sh` script (vendored or user-provided).
-    pub ralph_path: PathBuf,
+    /// Path to the alps-internal `scripts/` directory containing the
+    /// vendored prompt files (`AGENTS.md`, `CLAUDE.md`). Ralph reads these
+    /// from `script_dir` regardless of where the workspace lives.
+    pub scripts_dir: PathBuf,
     /// Path to the `CLAUDE.md` (Ralph's prompt file for Claude Code).
     pub claude_prompt_path: PathBuf,
     /// Path to the `AGENTS.md` (Ralph's prompt file for Codex).
@@ -190,7 +184,11 @@ pub struct ImplementConfig {
     #[serde(default)]
     pub deliverable_path: PathBuf,
 
-    /// Which Ralph implementation to invoke. Default: `Rust`.
+    /// Which Ralph implementation to invoke. The only valid value is
+    /// `RalphMode::Rust` (the default). Kept on the config for serde
+    /// backward-compatibility with persisted `implementation.json` files
+    /// from the port-era — silently coerces legacy `shell` values to `rust`
+    /// via the default derivation if encountered.
     /// See [`RalphMode`] docs for rationale.
     #[serde(default)]
     pub ralph_mode: RalphMode,
@@ -203,7 +201,7 @@ fn default_agents_prompt_path() -> PathBuf {
 impl Default for ImplementConfig {
     fn default() -> Self {
         ImplementConfig {
-            ralph_path: PathBuf::from("./scripts/ralph.sh"),
+            scripts_dir: PathBuf::from("./scripts"),
             claude_prompt_path: PathBuf::from("./scripts/CLAUDE.md"),
             agents_prompt_path: default_agents_prompt_path(),
             max_iterations: 20,
@@ -226,6 +224,14 @@ pub struct ImplementAgent {
     #[cfg(test)]
     pub(crate) test_handler:
         Option<std::sync::Arc<dyn Fn(Plan) -> Result<Implementation, ImplementError> + Send + Sync>>,
+    /// Test-only override: when set, the Ralph-internal `run()` call is
+    /// replaced by this closure. Lets the ralph-exit-code tests
+    /// (`implement_returns_partial_implementation_when_ralph_exits_nonzero`,
+    /// etc.) write a fake `prd.json` + `.ralph-result.json` directly
+    /// instead of spawning a real codex/claude/amp subprocess.
+    #[cfg(test)]
+    pub(crate) test_ralph_runner:
+        Option<std::sync::Arc<dyn Fn(&crate::ralph::RalphConfig) -> Result<crate::implement::RalphResult, crate::ralph::RalphError> + Send + Sync>>,
 }
 
 impl ImplementAgent {
@@ -235,6 +241,8 @@ impl ImplementAgent {
             workspace_root,
             #[cfg(test)]
             test_handler: None,
+            #[cfg(test)]
+            test_ralph_runner: None,
         }
     }
 
@@ -249,6 +257,8 @@ impl ImplementAgent {
             config: ImplementConfig::default(),
             workspace_root,
             test_handler: Some(std::sync::Arc::new(f)),
+            #[cfg(test)]
+            test_ralph_runner: None,
         }
     }
 
@@ -324,12 +334,10 @@ impl Agent for ImplementAgent {
         run_git(&ralph_dir, &["config", "user.name", "ALPS"])?;
         run_git(&ralph_dir, &["config", "commit.gpgsign", "false"])?;
 
-        // ── 3. Copy ralph.sh + CLAUDE.md + AGENTS.md into the working dir ──
-        copy_ralph_files(
-            &self.config.ralph_path,
+        // ── 3. Copy CLAUDE.md + AGENTS.md into the working dir ──
+        copy_prompt_files(
             &self.config.claude_prompt_path,
             &self.config.agents_prompt_path,
-            self.config.tool,
             &ralph_dir,
         )?;
 
@@ -392,15 +400,14 @@ venv/
 
         // ── 8. Invoke Ralph ──
         //
-        // Dispatch between Rust (default) and Shell (legacy escape hatch)
-        // implementations. The Rust path calls `alps_core::ralph::run`
-        // in-process — no subprocess, no argv leak, no orchestrator-death
-        // window at the bash↔Rust IPC boundary. The shell path preserves
-        // the original subprocess semantics for one release as a rollback
-        // safety net.
+        // Single in-process call to `alps_core::ralph::run`. No subprocess,
+        // no argv leak, no orchestrator-death window at the bash↔Rust IPC
+        // boundary — the only Ralph implementation ALPS ships since the
+        // ralph.sh→Rust port (smoke #19 verified the Rust path; smoke #21
+        // verified it under Tier-4 load).
         //
-        // Both paths write `.ralph-result.json` to `ralph_dir` on exit, so
-        // the `read_ralph_result` call below works regardless of mode.
+        // Ralph writes `.ralph-result.json` to `ralph_dir` on exit, so the
+        // `read_ralph_result` call below picks it up unchanged.
         elog!(
             "[implement] invoking Ralph: tool={}, max_iterations={}, stories={}, mode={:?}",
             self.config.tool, self.config.max_iterations, prd.user_stories.len(),
@@ -419,15 +426,9 @@ venv/
         // downstream `if !ralph_status.success() { ... }` branch.
         let ralph_status: RalphaStatusLike = match self.config.ralph_mode {
             RalphMode::Rust => {
-                // In-process Ralph. Build the config from the workspace
-                // state we just set up. The script_dir is the parent of
-                // ralph.sh (where the vendored AGENTS.md / CLAUDE.md live).
-                let script_dir = self
-                    .config
-                    .ralph_path
-                    .parent()
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| PathBuf::from("./scripts"));
+                // In-process Ralph. The scripts_dir is the alps-internal
+                // directory where the vendored AGENTS.md / CLAUDE.md live.
+                let script_dir = self.config.scripts_dir.clone();
 
                 let ralph_cfg = crate::ralph::RalphConfig::new(
                     ralph_dir.clone(),
@@ -436,12 +437,23 @@ venv/
                     self.config.max_iterations,
                 );
 
-                match crate::ralph::run(ralph_cfg).await {
+                // Test-only short-circuit: if a test_ralph_runner is set,
+                // use it instead of spawning a real Codex loop. Lets the
+                // ralph-exit-code tests write a synthetic `prd.json` +
+                // `.ralph-result.json` directly.
+                #[cfg(test)]
+                let ralph_result = if let Some(runner) = &self.test_ralph_runner {
+                    runner(&ralph_cfg)
+                } else {
+                    crate::ralph::run(ralph_cfg).await
+                };
+                #[cfg(not(test))]
+                let ralph_result = crate::ralph::run(ralph_cfg).await;
+
+                match ralph_result {
                     Ok(result) => {
                         // Rust Ralph writes `.ralph-result.json` itself,
-                        // so we already have it. The shell path needs to
-                        // wait for the subprocess to write it (which the
-                        // `status().await` does by blocking).
+                        // so we already have it.
                         //
                         // Synthesize an ExitStatus-like: completed=true
                         // → success(), completed=false → non-success.
@@ -460,34 +472,6 @@ venv/
                             msg: e.to_string(),
                         });
                     }
-                }
-            }
-            RalphMode::Shell => {
-                // Legacy subprocess path. Preserved for one release as a
-                // rollback safety net — set `ralph_mode = Shell` to use it.
-                let status = Command::new(&self.config.ralph_path)
-                    .args([
-                        "--tool", self.config.tool.as_str(),
-                        &self.config.max_iterations.to_string(),
-                    ])
-                    .current_dir(&ralph_dir)
-                    .stdout(Stdio::inherit())
-                    .stderr(Stdio::inherit())
-                    .status()
-                    .await
-                    .map_err(|e| ImplementError::Ralph {
-                        op: "spawn ralph.sh".to_string(),
-                        msg: e.to_string(),
-                    })?;
-                eprintln!(
-                    "[alps-diag] implement.run: ralph.sh status() returned (success={}, code={:?})",
-                    status.success(),
-                    status.code()
-                );
-                if status.success() {
-                    RalphaStatusLike::Success
-                } else {
-                    RalphaStatusLike::NonZero(status.code().unwrap_or(1))
                 }
             }
         };
@@ -554,8 +538,9 @@ venv/
         let stories_passed = prd_after.user_stories.iter().filter(|s| s.passes).count() as u32;
         let stories_total = prd_after.user_stories.len() as u32;
 
-        // Read ralph.sh's own metrics (iterations, elapsed_secs) so receipts
-        // show real numbers, not zeros.
+        // Read Ralph's own metrics (iterations, elapsed_secs) so receipts
+        // show real numbers, not zeros. (Formerly "ralph.sh's own metrics"
+        // — Ralph is now in-process but the metric reporting is the same.)
         eprintln!("[alps-diag] reading ralph result");
         let ralph_result = read_ralph_result(&ralph_dir)?;
         eprintln!("[alps-diag] ralph result: iterations={}, elapsed={}s", ralph_result.iterations, ralph_result.elapsed_secs);
@@ -679,26 +664,15 @@ async fn run_shell(dir: &Path, cmd: &str) -> Result<(), ImplementError> {
     Ok(())
 }
 
-fn copy_ralph_files(
-    ralph_src: &Path,
+fn copy_prompt_files(
     claude_src: &Path,
     agents_src: &Path,
-    tool: RalphTool,
     ralph_dir: &Path,
 ) -> Result<(), ImplementError> {
-    use std::os::unix::fs::PermissionsExt;
-
-    // Copy ralph.sh
-    let ralph_dst = ralph_dir.join("ralph.sh");
-    std::fs::copy(ralph_src, &ralph_dst).map_err(|e| {
-        ImplementError::RalphSetup(format!("copy ralph.sh from {:?}: {}", ralph_src, e))
-    })?;
-    std::fs::set_permissions(&ralph_dst, std::fs::Permissions::from_mode(0o755))
-        .map_err(|e| ImplementError::RalphSetup(format!("chmod ralph.sh: {}", e)))?;
-
-    // Copy the prompt file that matches the chosen tool.
+    // Copy the prompt files that match the chosen tool.
     // Always copy both AGENTS.md and CLAUDE.md when they exist — Ralph will
-    // only read the one it needs, but the file presence keeps ralph.sh happy.
+    // only read the one it needs, but the file presence is what AGENTS.md
+    // and CLAUDE.md-driven tools look for at startup.
     for src in [claude_src, agents_src] {
         if !src.exists() {
             continue;
@@ -713,7 +687,6 @@ fn copy_ralph_files(
         })?;
     }
 
-    let _ = tool; // tool choice is communicated via --tool flag, not file content
     Ok(())
 }
 
@@ -746,7 +719,6 @@ fn read_commits(ralph_dir: &Path) -> Result<Vec<Commit>, ImplementError> {
 // Files we added ourselves — kept out of the artifacts list so they
 // don't pollute the Judge's review prompt.
 const SKIP_FILES: &[&str] = &[
-    "ralph.sh",
     "CLAUDE.md",
     "AGENTS.md",
     "prd.json",
@@ -1259,77 +1231,110 @@ mod tests {
     // ─────────────────────────────────────────────────────────────
     // Ralph exit-code handling tests (SPEC §12 item #2)
     //
-    // These tests use a fake ralph.sh script so we can exercise the
-    // ralph-non-zero path without spawning a real Codex loop. The
-    // for_test() constructor bypasses run() entirely, so we need a
-    // real ralph.sh to verify exit-code handling.
+    // These tests pin the contract that ralph hitting max-iterations
+    // with partial progress (or with a non-zero pseudo-exit) returns an
+    // Implementation, not an ImplementError. After the ralph.sh→Rust
+    // port (and the post-merge cleanup that deleted `scripts/ralph.sh`),
+    // we drive the dispatch via the `test_ralph_runner` hook — a
+    // closure that writes a synthetic `prd.json` + `.ralph-result.json`
+    // directly instead of spawning a real Codex loop. The orchestrator's
+    // exit-code handling logic is load-bearing and tested here WITHOUT
+    // depending on a real tool subprocess.
     // ─────────────────────────────────────────────────────────────
 
-    /// Write a fake ralph.sh that simulates "ran but hit max-iterations
-    /// with partial progress". Marks the first user story as `passes: true`
-    /// in prd.json, writes a `.ralph-result.json` with `completed: false`,
-    /// then exits 1.
-    fn write_fake_ralph_partial(dir: &Path) {
-        let script = r#"#!/bin/bash
-# Fake ralph.sh: mark first story as passed, write .ralph-result.json, exit 1
-set -e
-cd "$(pwd)"
-# Read existing prd.json, mark first story as passed
-if command -v jq >/dev/null 2>&1; then
-  jq '.userStories[0].passes = true' prd.json > prd.json.tmp
-  mv prd.json.tmp prd.json
-else
-  # Fallback: just touch a marker so the test can detect we ran
-  touch .fake-ralph-ran
-fi
-# Write .ralph-result.json with completed: false (hit max iterations)
-echo '{"iterations": 3, "elapsed_secs": 60, "completed": false}' > .ralph-result.json
-exit 1
-"#;
-        std::fs::write(dir.join("ralph.sh"), script).unwrap();
-        std::fs::set_permissions(
-            dir.join("ralph.sh"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+    /// Build a `test_ralph_runner` that simulates "ralph ran but hit
+    /// max-iterations with partial progress". Marks the first story
+    /// passed in `prd.json`, writes a `.ralph-result.json` with
+    /// `completed: false`, returns the matching `RalphResult`.
+    fn make_ralph_partial_runner() -> std::sync::Arc<
+        dyn Fn(&crate::ralph::RalphConfig) -> Result<crate::implement::RalphResult, crate::ralph::RalphError>
+            + Send
+            + Sync,
+    > {
+        std::sync::Arc::new(|cfg: &crate::ralph::RalphConfig| {
+            let ralph_dir = &cfg.ralph_dir;
+            let prd_path = ralph_dir.join("prd.json");
+            let raw = std::fs::read_to_string(&prd_path).unwrap();
+            let mut prd: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if let Some(stories) = prd.get_mut("userStories").and_then(|s| s.as_array_mut()) {
+                if !stories.is_empty() {
+                    stories[0]["passes"] = serde_json::Value::Bool(true);
+                }
+            }
+            std::fs::write(&prd_path, serde_json::to_string_pretty(&prd).unwrap()).unwrap();
+            std::fs::write(
+                ralph_dir.join(".ralph-result.json"),
+                r#"{"iterations": 3, "elapsed_secs": 60, "completed": false}"#,
+            )
+            .unwrap();
+            Ok(crate::implement::RalphResult {
+                iterations: 3,
+                elapsed_secs: 60,
+                completed: false,
+            })
+        })
     }
 
-    /// Write a fake ralph.sh that exits 0 with all stories marked as passed.
-    fn write_fake_ralph_complete(dir: &Path) {
-        let script = r#"#!/bin/bash
-# Fake ralph.sh: mark all stories as passed, write .ralph-result.json, exit 0
-set -e
-cd "$(pwd)"
-if command -v jq >/dev/null 2>&1; then
-  jq '.userStories |= map(.passes = true)' prd.json > prd.json.tmp
-  mv prd.json.tmp prd.json
-fi
-echo '{"iterations": 2, "elapsed_secs": 30, "completed": true}' > .ralph-result.json
-exit 0
-"#;
-        std::fs::write(dir.join("ralph.sh"), script).unwrap();
-        std::fs::set_permissions(
-            dir.join("ralph.sh"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+    /// Build a `test_ralph_runner` that simulates ralph finishing all
+    /// stories on iter 2 with `completed: true`.
+    fn make_ralph_complete_runner() -> std::sync::Arc<
+        dyn Fn(&crate::ralph::RalphConfig) -> Result<crate::implement::RalphResult, crate::ralph::RalphError>
+            + Send
+            + Sync,
+    > {
+        std::sync::Arc::new(|cfg: &crate::ralph::RalphConfig| {
+            let ralph_dir = &cfg.ralph_dir;
+            let prd_path = ralph_dir.join("prd.json");
+            let raw = std::fs::read_to_string(&prd_path).unwrap();
+            let mut prd: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            if let Some(stories) = prd.get_mut("userStories").and_then(|s| s.as_array_mut()) {
+                for story in stories.iter_mut() {
+                    story["passes"] = serde_json::Value::Bool(true);
+                }
+            }
+            std::fs::write(&prd_path, serde_json::to_string_pretty(&prd).unwrap()).unwrap();
+            std::fs::write(
+                ralph_dir.join(".ralph-result.json"),
+                r#"{"iterations": 2, "elapsed_secs": 30, "completed": true}"#,
+            )
+            .unwrap();
+            Ok(crate::implement::RalphResult {
+                iterations: 2,
+                elapsed_secs: 30,
+                completed: true,
+            })
+        })
     }
 
-    /// Write a fake ralph.sh that exits 1 WITHOUT writing prd.json.
-    /// Simulates "ralph couldn't even start" — should still error.
-    fn write_fake_ralph_no_prd(dir: &Path) {
-        let script = r#"#!/bin/bash
-exit 1
-"#;
-        std::fs::write(dir.join("ralph.sh"), script).unwrap();
-        std::fs::set_permissions(
-            dir.join("ralph.sh"),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .unwrap();
+    /// Build a `test_ralph_runner` that simulates ralph crashing before
+    /// it could write any progress. prd.json stays at the initial state
+    /// written by step 4 (all stories `passes: false`), and
+    /// `.ralph-result.json` is written with `completed: false`.
+    fn make_ralph_crash_runner() -> std::sync::Arc<
+        dyn Fn(&crate::ralph::RalphConfig) -> Result<crate::implement::RalphResult, crate::ralph::RalphError>
+            + Send
+            + Sync,
+    > {
+        std::sync::Arc::new(|cfg: &crate::ralph::RalphConfig| {
+            let ralph_dir = &cfg.ralph_dir;
+            // Don't mutate prd.json — step 4 wrote it with all stories
+            // `passes: false`, and that's the state we want to read back.
+            std::fs::write(
+                ralph_dir.join(".ralph-result.json"),
+                r#"{"iterations": 1, "elapsed_secs": 5, "completed": false}"#,
+            )
+            .unwrap();
+            Ok(crate::implement::RalphResult {
+                iterations: 1,
+                elapsed_secs: 5,
+                completed: false,
+            })
+        })
     }
 
-    /// Write a stub AGENTS.md (ralph.sh's prompt file). Just needs to exist.
+    /// Write a stub AGENTS.md in the scripts_dir. Required because the
+    /// orchestrator's step 4 (copy_prompt_files) reads the source file
+    /// before copying it into the ralph workspace.
     fn write_fake_agents_prompt(dir: &Path) {
         std::fs::write(
             dir.join("AGENTS.md"),
@@ -1338,32 +1343,49 @@ exit 1
         .unwrap();
     }
 
+    /// Build an `ImplementAgent` with the test_ralph_runner hook set
+    /// to `runner`. Resolves the ralph workspace + scripts_dir into the
+    /// two tempdirs the test fixture creates.
+    fn build_agent_with_test_runner(
+        scripts_dir: &Path,
+        workdir: &Path,
+        runner: std::sync::Arc<
+            dyn Fn(&crate::ralph::RalphConfig) -> Result<crate::implement::RalphResult, crate::ralph::RalphError>
+                + Send
+                + Sync,
+        >,
+    ) -> ImplementAgent {
+        let mut agent = ImplementAgent::new(
+            workdir.to_path_buf(),
+            ImplementConfig {
+                scripts_dir: scripts_dir.to_path_buf(),
+                claude_prompt_path: scripts_dir.join("AGENTS.md"),
+                agents_prompt_path: scripts_dir.join("AGENTS.md"),
+                max_iterations: 5,
+                tool: RalphTool::Codex,
+                init_command: None,
+                deliverable_path: workdir.join("implementation").join("ralph"),
+                ralph_mode: RalphMode::Rust,
+            },
+        );
+        agent.test_ralph_runner = Some(runner);
+        agent
+    }
+
     #[tokio::test]
     async fn implement_returns_partial_implementation_when_ralph_exits_nonzero() {
         // SPEC §12 item #2: ralph hitting max-iterations with partial
         // progress should NOT be a hard error. It should return an
         // Implementation with the partial state so the loop's Judge
         // can route it through the reject path.
-        let script_dir = tempdir_via_tmp("alps-fake-ralph-partial-script");
-        write_fake_ralph_partial(&script_dir);
-        write_fake_agents_prompt(&script_dir);
+        let scripts_dir = tempdir_via_tmp("alps-fake-ralph-partial-scripts");
+        write_fake_agents_prompt(&scripts_dir);
 
         let workdir = tempdir_via_tmp("alps-fake-ralph-partial-workdir");
-        let agent = ImplementAgent::new(
-            workdir.clone(),
-            ImplementConfig {
-                ralph_path: script_dir.join("ralph.sh"),
-                claude_prompt_path: script_dir.join("AGENTS.md"),
-                agents_prompt_path: script_dir.join("AGENTS.md"),
-                max_iterations: 5,
-                tool: RalphTool::Codex,
-                init_command: None,
-                deliverable_path: workdir.join("implementation").join("ralph"),
-                // These tests use a fake ralph.sh that simulates subprocess
-                // semantics — exercise the Shell path explicitly so the
-                // Rust-vs-Shell dispatch is also covered.
-                ralph_mode: RalphMode::Shell,
-            },
+        let agent = build_agent_with_test_runner(
+            &scripts_dir,
+            &workdir,
+            make_ralph_partial_runner(),
         );
 
         let plan = dummy_plan();
@@ -1382,7 +1404,7 @@ exit 1
         // completed=false from .ralph-result.json
         // (note: we don't yet surface this in metrics — see SPEC §12)
 
-        let _ = std::fs::remove_dir_all(&script_dir);
+        let _ = std::fs::remove_dir_all(&scripts_dir);
         let _ = std::fs::remove_dir_all(&workdir);
     }
 
@@ -1390,24 +1412,14 @@ exit 1
     async fn implement_returns_full_implementation_when_ralph_exits_zero() {
         // Happy path: ralph finishes all stories, exits 0. Should return
         // Implementation with all stories passing.
-        let script_dir = tempdir_via_tmp("alps-fake-ralph-complete-script");
-        write_fake_ralph_complete(&script_dir);
-        write_fake_agents_prompt(&script_dir);
+        let scripts_dir = tempdir_via_tmp("alps-fake-ralph-complete-scripts");
+        write_fake_agents_prompt(&scripts_dir);
 
         let workdir = tempdir_via_tmp("alps-fake-ralph-complete-workdir");
-        let agent = ImplementAgent::new(
-            workdir.clone(),
-            ImplementConfig {
-                ralph_path: script_dir.join("ralph.sh"),
-                claude_prompt_path: script_dir.join("AGENTS.md"),
-                agents_prompt_path: script_dir.join("AGENTS.md"),
-                max_iterations: 5,
-                tool: RalphTool::Codex,
-                init_command: None,
-                deliverable_path: workdir.join("implementation").join("ralph"),
-                // Shell mode — see test above.
-                ralph_mode: RalphMode::Shell,
-            },
+        let agent = build_agent_with_test_runner(
+            &scripts_dir,
+            &workdir,
+            make_ralph_complete_runner(),
         );
 
         let plan = dummy_plan();
@@ -1418,48 +1430,35 @@ exit 1
         assert_eq!(implementation.metrics.stories_total, 2);
         assert_eq!(implementation.metrics.iterations, 2);
 
-        let _ = std::fs::remove_dir_all(&script_dir);
+        let _ = std::fs::remove_dir_all(&scripts_dir);
         let _ = std::fs::remove_dir_all(&workdir);
     }
 
     #[tokio::test]
     async fn implement_errors_when_ralph_exits_nonzero_and_prd_missing() {
-        // Edge case: ralph exits 1 AND prd.json doesn't exist (e.g., the
-        // pre-step 4 write failed, or ralph deleted it). This IS a real
-        // error — we can't recover without ralph's progress.
-        let script_dir = tempdir_via_tmp("alps-fake-ralph-no-prd-script");
-        write_fake_ralph_no_prd(&script_dir);
-        write_fake_agents_prompt(&script_dir);
+        // Edge case: ralph exits 1 with no progress. The orchestrator
+        // wrote prd.json in step 4 BEFORE running ralph, so the file
+        // exists even when ralph exits with no progress. This test
+        // verifies that we DON'T crash when ralph exits 1 — we get an
+        // Implementation with no progress.
+        let scripts_dir = tempdir_via_tmp("alps-fake-ralph-no-prd-scripts");
+        write_fake_agents_prompt(&scripts_dir);
 
         let workdir = tempdir_via_tmp("alps-fake-ralph-no-prd-workdir");
-        let agent = ImplementAgent::new(
-            workdir.clone(),
-            ImplementConfig {
-                ralph_path: script_dir.join("ralph.sh"),
-                claude_prompt_path: script_dir.join("AGENTS.md"),
-                agents_prompt_path: script_dir.join("AGENTS.md"),
-                max_iterations: 5,
-                tool: RalphTool::Codex,
-                init_command: None,
-                deliverable_path: workdir.join("implementation").join("ralph"),
-                // Shell mode — see test above.
-                ralph_mode: RalphMode::Shell,
-            },
+        let agent = build_agent_with_test_runner(
+            &scripts_dir,
+            &workdir,
+            make_ralph_crash_runner(),
         );
 
         let plan = dummy_plan();
         let result = agent.run(plan).await;
 
-        // Actually wait — implement.rs writes prd.json in step 4 BEFORE
-        // running ralph. So prd.json WILL exist even if ralph exits 1.
-        // This test will pass with an Implementation (0/2 stories), not
-        // an error. Let me adjust: this test verifies that we DON'T crash
-        // when ralph exits 1 — we get an Implementation with no progress.
-        let implementation = result.expect("ralph exit 1 with prd.json exists → Implementation, not error");
+        let implementation = result.expect("ralph exit 1 with prd.json exists -> Implementation, not error");
         assert_eq!(implementation.metrics.stories_passed, 0);
         assert_eq!(implementation.metrics.stories_total, 2);
 
-        let _ = std::fs::remove_dir_all(&script_dir);
+        let _ = std::fs::remove_dir_all(&scripts_dir);
         let _ = std::fs::remove_dir_all(&workdir);
     }
 }

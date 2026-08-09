@@ -694,14 +694,14 @@ async fn run_task(
         .and_then(|p| p.parent().map(|p| p.to_path_buf()))
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let ralph_path = alps_root.join("scripts/ralph.sh");
-    let claude_prompt_path = alps_root.join("scripts/CLAUDE.md");
+    let scripts_dir = alps_root.join("scripts");
+    let claude_prompt_path = scripts_dir.join("CLAUDE.md");
 
     let plan = PlanAgent::new("claude-sonnet-4");
     let implement = ImplementAgent::new(
         workspace.root.clone(),
         alps_core::implement::ImplementConfig {
-            ralph_path,
+            scripts_dir,
             claude_prompt_path,
             deliverable_path,
             ..Default::default()

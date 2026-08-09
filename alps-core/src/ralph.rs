@@ -38,9 +38,9 @@
 //! *observable behavior* must match. The diff against ralph.sh is documented
 //! inline next to each section.
 //!
-//! The shell escape hatch (`RalphMode::Shell`) is kept for one release as a
-//! rollback safety net, then removed in a follow-up commit. See
-//! `implement.rs` for the dispatch logic.
+//! (The legacy `RalphMode::Shell` escape hatch was removed after smoke #21
+//! verified the Rust path end-to-end. ALPS ralph is now a single in-process
+//! library function — no subprocess, no IPC boundary, no argv leak.)
 //!
 //! # State file locations (FIXED: workspace, NOT script dir)
 //!

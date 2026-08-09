@@ -107,10 +107,10 @@ If the Judge **rejects**, the loop restarts at Plan with feedback appended to th
 
 ### 2.1 The compose boundary with Ralph
 
-ALPS is the **outer orchestrator**. Ralph is the **inner implement loop**. ALPS treats Ralph as a black-box subprocess:
+ALPS is the **outer orchestrator**. Ralph is the **inner implement loop**, implemented as an in-process Rust library (`alps-core/src/ralph.rs`) so the orchestrator hot path never crosses a bash↔Rust IPC boundary. Composition contract:
 
 - ALPS writes `prd.json` (a 1:1 mapping from `Plan.stories` to Ralph's `userStories` format) and `progress.txt` (with `## Codebase Patterns` header) into `tasks/<id>/implementation/ralph/<workdir>`.
-- ALPS spawns `ralph.sh --tool codex <max-iterations>` with stdin/stdout inherited. Ralph runs its own loop: read PRD → pick story → implement → test → commit → loop. Ralph exits 0 when `<promise>COMPLETE</promise>` lands in `.codex-last-message.txt` (the codex-specific completion extraction; commits `799067d`–`752c41a`).
+- ALPS calls `alps_core::ralph::run(cfg: RalphConfig)` in-process. Ralph runs its own loop: read PRD → pick story → invoke tool (codex / claude / amp) → implement → test → commit → loop. Ralph exits with `completed: true` in `.ralph-result.json` when `<promise>COMPLETE</promise>` lands in `.codex-last-message.txt` (the codex-specific completion extraction; commits `799067d`–`752c41a`).
 - ALPS reads back `prd.json` (stories now have `passes: true`), `progress.txt`, and `git log` for commits → typed `Implementation`. The `ImplementMetrics` (stories_passed, stories_total, iterations, elapsed_secs) are read from `.ralph-result.json` (persisted by Ralph after each invocation) and plumbed through to `Receipts`.
 - `read_artifacts` walks `tasks/<id>/implementation/ralph/` (or `--deliverable-path` if set) recursively to populate `Implementation.artifacts` for the LLM Judge. Skips `target/`, `node_modules/`, `.git/`, etc. via `SKIP_DIRS`.
 
@@ -728,8 +728,8 @@ alps/                              # Cargo workspace
     └── src/
         ├── main.rs                # CLI entry — `alps run "prompt" [--workdir] [--force] [--deliverable-path]`
         └── detect.rs              # v0.7.1+3 auto-detect --deliverable-path from prompt text (stdlib only)
-├── scripts/                       # Vendored from snarktank/ralph
-│   ├── ralph.sh                   # Ralph loop runner (must be executable)
+├── scripts/                       # Vendored Ralph prompt templates
+│   ├── AGENTS.md                  # Ralph's Codex prompt (read by codex --AGENTS.md)
 │   └── CLAUDE.md                  # Ralph's Claude Code prompt
 └── tasks/                         # Per-task workspaces, git-committed per state
 ```
@@ -756,7 +756,7 @@ tasks/<task-id>/
         ├── .ralph-result.json     # ImplementMetrics (stories_passed, iterations, elapsed_secs)
         ├── .codex-last-message.txt# Codex completion signal (`<promise>COMPLETE</promise>` extraction)
         ├── CLAUDE.md              # Ralph's Claude Code prompt (vendored)
-        ├── ralph.sh               # Ralph's loop runner (vendored)
+        ├── AGENTS.md              # Ralph's Codex prompt (read by codex --AGENTS.md)
         └── *.git/                 # Nested git repo, excluded from parent
 ```
 
@@ -983,6 +983,20 @@ quality-of-life or scale concerns.
 9.8. **Smoke wrapper deduplication — generic `alps-tier4-smoke-wrapper.sh <smoke-N>` template (SHIPPED 2026-08-07).** Replaced 5 per-smoke wrappers (`smoke-{13,14,15,16,17}-wrapper.sh`, each ~258 lines, 95% identical — differed only on smoke number, log prefix, workdir/deliverable paths, prompt file) with a single parameterized wrapper at `/tmp/alps-tier4-smoke-wrapper.sh`. Wrapper takes 5 required flags: `--smoke-number`, `--workdir`, `--deliverable-path`, `--prompt-template`, `--log-prefix`. All diagnostic machinery (strace attach, process tree snapshots, journalctl deltas, dmesg, panic/signal-handler side files, receipts preservation) is identical across smokes — only the flag values change. The `PRESERVE_DIR` is auto-derived from `LOG_PREFIX` via `${LOG_PREFIX%-stderr}-preserved`. **Smoke #18 verification (2026-08-07):** wrapper fired against the canonical prompt template (symlinked at `/tmp/alps-tier4-notes-prompt.txt` → `notes-prompt-17.txt`), received Judge ACCEPT verdict on iter 3 of 3 outer iterations (8/8 stories, 12/12 review assertions, opus-4 judge, 60-min wall clock). `/tmp/alps-prompt.18.waqhZo.txt` (7860 bytes) was created via mktemp, read by alps on startup, best-effort deleted. Prompt substitution: 359 occurrences of `--deliverable-path` value in stderr, 0 leaks of the old hardcoded path. Strace attached 17.2M lines over the 60-min run. `repos/alps` working tree: 5 new `resolve_prompt` unit tests in `alps-cli/src/main.rs` (commit `8079e98`) + 8 new bash tests in `tests/test_prompt_substitution.sh` cover the prompt-substitution + prompt-file contracts end-to-end. Workspace test count: 128 → 133 (with the known telemetry flake).
 
 9.10. **§12 item 9.10 — `ralph.sh` → in-process Rust library port (IMPLEMENTED LOCALLY 2026-08-08; PR NOT YET RAISED; core commit `cbfd59a`, smoke #20 verification + stdin-fix commit `63b876a`).** Local branch: `refactor/alps-ralph-rust-port`. Ralph Wiggum (`scripts/ralph.sh`, 282 lines of bash) is the inner implement loop that drives `ALPS`'s `ImplementAgent::run`. Two consecutive production smokes burned us at the bash↔Rust IPC boundary: smoke #15 (2026-08-07) — orchestrator SIGTERM after ralph returned because the signal sender lived outside alps's process tree, requiring `setpgid(0,0)` + `PR_SET_PDEATHSIG` on both sides; smoke #18 (2026-08-07) — argv-leak, requiring the `--prompt-file` flag. Both workarounds are symptoms of the same root cause: the orchestrator hot path crosses a bash↔Rust IPC boundary via a subprocess. **The port eliminates that boundary.** New module `alps-core/src/ralph.rs` (~895 lines, including `RalphConfig` + `RalphResult` + `read_prd` + `all_user_stories_pass` + `run` + helpers) is a line-for-line port of the bash: same state-file locations in `ralph_dir` (not `script_dir` — the `test-state-file-location.sh` guard ported verbatim), same `OpenOptions::append(true)` for the `tee -a /dev/stderr` FIX #6 (preserves the orchestrator's earlier `elog!` writes), same `all_user_stories_pass` phantom-COMPLETE guard (the §12 item 9 ralph-side guard from commit `a62c91d`), same `sleep 2` between iterations, same `.ralph-result.json` write-on-every-exit-path semantics. New public API: `alps_core::ralph::run(cfg: RalphConfig) -> Result<RalphResult, RalphError>` (orchestrator's `ImplementAgent::run` now calls this in-process when `ImplementConfig::ralph_mode == RalphMode::Rust`, the default). Operator-facing CLI parity: `alps ralph --tool codex --max-iter 5 --ralph-dir /tmp/foo/` (the new subcommand in `alps-cli/src/main.rs`) is a thin wrapper over the same library function — no subprocess, no argv leak, no orchestrator-death window. **The Shell escape hatch (`RalphMode::Shell` → `exec scripts/ralph.sh`) is intentionally kept for one release as a rollback safety net** — set `ralph_mode = Shell` on `ImplementConfig` to use it. Removal is a follow-up commit after smoke #19 verifies the Rust path.
+
+
+*Resolution (2026-08-09, post-merge cleanup):* The "follow-up commit after smoke #19 verifies the Rust path" referenced above was deferred past the PR #13 merge (smoke #19 was the RED-then-GREEN that proved the Rust path; smoke #21 verified it under Tier-4 load — 1,114s wall-clock, 8/8 stories, Judge `claude-opus-4` ACCEPT first try). Now that the Rust path is the only production-verified mode, the legacy escape hatch is gone:
+
+- `enum RalphMode` has been collapsed to a single variant `Rust`. The `Shell` variant is deleted.
+- `ImplementConfig::ralph_path` (the path to `scripts/ralph.sh`) is replaced by `scripts_dir` (the path to the alps-internal `scripts/` directory containing the vendored `AGENTS.md` / `CLAUDE.md` prompt files). The dispatch (`implement.rs::run`) now passes `scripts_dir` directly as `RalphConfig::script_dir`.
+- `scripts/ralph.sh` (the 282-line bash) is deleted.
+- `copy_ralph_files` (which copied `ralph.sh` + `AGENTS.md` + `CLAUDE.md` into the ralph workspace) is renamed `copy_prompt_files` (only copies the prompts). The `ralph.sh` step is gone.
+- `SKIP_FILES` no longer mentions `ralph.sh`.
+- The 3 ralph-exit-code tests (`implement_returns_partial_implementation_when_ralph_exits_nonzero`, `implement_returns_full_implementation_when_ralph_exits_zero`, `implement_errors_when_ralph_exits_nonzero_and_prd_missing`) previously drove a fake `ralph.sh` via `RalphMode::Shell`. They now drive `alps_core::ralph::run` via a new `cfg(test)`-only `test_ralph_runner` hook on `ImplementAgent` — same observable behavior, no fake script, no subprocess.
+- The `alps-cli` `run_task` no longer needs `ralph_path` — it sets `scripts_dir = alps_root.join("scripts")`.
+- Workspace test count unchanged at 175 (144 lib + 4 + 4 integration + 23 alps-binary). Compile green, all tests pass.
+
+**Smoke verification remains load-bearing:** `RalphMode::Rust` is the only mode ALPS ships, and it's the path smoke #21 verified end-to-end. The smoke wrapper at `/tmp/alps-tier4-smoke-wrapper.sh` is unchanged. If a future ALPS change needs to test the legacy subprocess semantics, the old `RalphMode::Shell` implementation can be reintroduced from git history (commit `d92ad99` predates this cleanup; the `Shell` variant and `scripts/ralph.sh` exist there).
 
 **Smoke #19 verification (2026-08-08, RED, then fixed via commit `63b876a`):** `/tmp/alps-tier4-smoke-wrapper.sh --smoke-number 19` launched against the canonical Tier-4 notes-app prompt with `ralph_mode = Rust` (the new default). After 20/20 iterations at 24:36 wall-clock, `implementation.json` showed `0/11 stories_passed` and Ralph correctly reported `completed: false`. **Root cause:** the port used `Stdio::piped()` + `stdin.write_all(...)` + `drop(stdin)` to push the prompt bytes then close the FD; bash's `ralph.sh` line 207 used `codex ... < "$RALPH_AGENTS"` which inherits the file FD as stdin (stays open until codex exits). Codex's tool router detects a closed-stdin session at startup and refuses to run with `write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open`. **Fix (commit `63b876a`):** spawn each tool (codex, claude, amp) with `Stdio::from(File)` pointing at the prompt file. Same semantics as bash's `< file` shell redirect — FD is open, tool reads from it directly. Applied to all three tool branches preemptively. `cargo build` clean, `cargo test` 168 passed (no new warnings).
 
