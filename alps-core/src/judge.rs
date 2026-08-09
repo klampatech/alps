@@ -860,6 +860,54 @@ impl StructuredJudge for DoDRunner {
     }
 }
 
+/// Subdirs that should never be walked for project detection — they
+/// contain vendored dependencies, build artifacts, or version-control
+/// metadata that would produce false-positive classifications or burn
+/// cycles on large trees.
+const SKIP_DETECT_SUBDIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".cache",
+    ".tox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+];
+
+/// True if the dir's root-level entries contain Rust / Python / Node / Go
+/// markers — used by `detect_project_type` to short-circuit before
+/// recursing into monorepo subdirs. Kept in a helper so the recursion
+/// helper below can call it for both the root and each child.
+fn has_project_marker(dir: &Path) -> bool {
+    dir.join("Cargo.toml").exists()
+        || dir.join("Cargo.lock").exists()
+        || dir.join("pyproject.toml").exists()
+        || dir.join("setup.py").exists()
+        || dir.join("pytest.ini").exists()
+        || dir.join("package.json").exists()
+        || dir.join("go.mod").exists()
+        || has_py_tests(dir)
+}
+
+/// Classify the project rooted at `dir` by walking the dir itself plus
+/// one level of immediate subdirs (skipping heavy/vendor subdirs).
+///
+/// **Priority order** (matters for ALPS running against itself):
+/// 1. Root-level markers win over nested markers — if `Cargo.toml` sits
+///    at the deliverable root, the project is Rust even if there's a
+///    `frontend/package.json` somewhere underneath.
+/// 2. Among monorepo subdirs, the **first** subdir (alphabetical, by
+///    `read_dir` order on Linux ext4) to match wins. This is
+///    deterministic on a given filesystem; Tier-4 smokes that care
+///    about a specific sub-project should set `--deliverable-path` to
+///    point at that subdir directly.
 fn detect_project_type(dir: &Path) -> ProjectType {
     if dir.join("Cargo.toml").exists() || dir.join("Cargo.lock").exists() {
         return ProjectType::Rust;
@@ -877,6 +925,39 @@ fn detect_project_type(dir: &Path) -> ProjectType {
     }
     if dir.join("go.mod").exists() {
         return ProjectType::Go;
+    }
+
+    // Root had no marker file. For monorepo layouts (Tier-4 deliverable
+    // is `backend/{pyproject.toml,...}` + `frontend/{package.json,...}`),
+    // walk one level of immediate subdirs and try to classify. Skip
+    // vendor / build dirs to keep the walk bounded and deterministic.
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => return ProjectType::Unknown,
+    };
+    let mut children: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if SKIP_DETECT_SUBDIRS.contains(&name) {
+            continue;
+        }
+        children.push(path);
+    }
+    // Sort for deterministic ordering across filesystems — `read_dir`
+    // doesn't guarantee order on every platform, and the test suite
+    // needs stable results.
+    children.sort();
+    for child in &children {
+        if !has_project_marker(child) {
+            continue;
+        }
+        return detect_project_type(child);
     }
     ProjectType::Unknown
 }
@@ -1314,6 +1395,102 @@ mod tests {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("README.md"), "# readme").unwrap();
         assert_eq!(detect_project_type(&dir), ProjectType::Unknown);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_python_project_in_nested_subdir_monorepo() {
+        // Mirrors smoke #21 (Tier-4 full-stack notes app): the deliverable
+        // root contains backend/{pyproject.toml,app/} and frontend/{package.json,src/}
+        // but nothing matching the detector's marker set AT the root. The
+        // detector must walk immediate subdirs (depth 1-2) to find the
+        // Python backend; otherwise every Tier-4 monorepo falls into the
+        // "Unknown → skip" short-circuit and the LLM Judge is the
+        // load-bearing verifier alone.
+        let dir = make_tmp_dir();
+        let backend = dir.join("backend");
+        std::fs::create_dir_all(&backend).unwrap();
+        std::fs::write(backend.join("pyproject.toml"), "[project]").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_node_project_in_nested_subdir_monorepo() {
+        // Symmetric case: package.json lives one level down (frontend/).
+        let dir = make_tmp_dir();
+        let frontend = dir.join("frontend");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::write(frontend.join("package.json"), "{}").unwrap();
+        assert_eq!(detect_project_type(&dir), ProjectType::Node);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_does_not_walk_into_heavy_subdirs() {
+        // Don't burn cycles / false positives walking node_modules, .git,
+        // target, dist, __pycache__, .venv, venv, etc. If the recursion
+        // hits one of those and finds a marker file, it could falsely
+        // classify the repo. Pin: skip these subdirs during the walk.
+        let dir = make_tmp_dir();
+        let node_modules = dir.join("node_modules").join("foo");
+        std::fs::create_dir_all(&node_modules).unwrap();
+        std::fs::write(node_modules.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_project_type(&dir),
+            ProjectType::Unknown,
+            "node_modules/* must not be walked for project detection"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_tier4_fullstack_monorepo_layout() {
+        // Exact mirror of smoke #21 deliverable layout: a monorepo with
+        // `backend/` (Python, pyproject.toml at depth 1) and `frontend/`
+        // (Node, package.json at depth 1) and nothing matching the
+        // detector's marker set AT the root. Pre-fix this returned
+        // Unknown and the structured DoD short-circuited, leaving the
+        // LLM Judge as the load-bearing verifier. Post-fix the detector
+        // returns Python (root-priority Rust check fails; first matching
+        // subdir in sorted order is `backend/` which wins over
+        // `frontend/` alphabetically).
+        let dir = make_tmp_dir();
+        let backend = dir.join("backend");
+        let frontend = dir.join("frontend");
+        std::fs::create_dir_all(&backend).unwrap();
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::write(backend.join("pyproject.toml"), "[project]").unwrap();
+        std::fs::write(frontend.join("package.json"), "{}").unwrap();
+        // `backend` sorts before `frontend` alphabetically, so Python
+        // wins under the deterministic sorted-walk contract. This is
+        // the expected behavior — Tier-4's structured DoD will fire
+        // `pytest -q` against `backend/`.
+        assert_eq!(
+            detect_project_type(&dir),
+            ProjectType::Python,
+            "Tier-4 monorepo (backend pyproject + frontend package.json) must classify as Python"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn detect_root_marker_wins_over_nested_marker() {
+        // Priority contract: if a marker file exists at the dir root,
+        // that's the project type, even if a different-language marker
+        // exists in a subdir. Matters for ALPS running against itself
+        // (deliverable IS the alps repo, which has a `frontend/` or
+        // docs-site subdir with package.json but should still be Rust).
+        let dir = make_tmp_dir();
+        std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
+        let frontend = dir.join("frontend");
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::write(frontend.join("package.json"), "{}").unwrap();
+        assert_eq!(
+            detect_project_type(&dir),
+            ProjectType::Rust,
+            "root-level Cargo.toml must win over nested package.json"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
