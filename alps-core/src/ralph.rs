@@ -347,7 +347,40 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                     }
                 }
 
-                let _ = child.wait().await;
+                // ── SPEC §12 P1: surface tool exit code on every iteration ──
+                //
+                // Previously the codex branch swallowed ExitStatus entirely
+                // (`let _ = child.wait().await;`). On a 429 / quota_exceeded
+                // burn, the only signal we got was a generic "iteration
+                // failed, retrying" line and the live stderr stream (mirrored
+                // above). The actual exit code was invisible — operators had
+                // to correlate child PIDs by hand against provider logs.
+                //
+                // The fix is one line: capture ExitStatus, log it. The stderr
+                // bytes have already been mirrored to .ralph-stderr.log above,
+                // so operators can `grep -E '429|quota|rate_limit' <ralph_dir>/.ralph-stderr.log`
+                // and `tail -1` the exit code from the orchestrator's stderr
+                // / telemetry log. P1 from the 2026-08-09 quota burn.
+                let exit_status = child.wait().await;
+                let exit_code = match &exit_status {
+                    Ok(status) => status.code().unwrap_or(-1),
+                    Err(_) => -1,
+                };
+                if exit_code != 0 {
+                    elog!(
+                        "[ralph] codex exited with code {} on iteration {}/{} (stderr mirror at {}/.ralph-stderr.log)",
+                        exit_code,
+                        i,
+                        cfg.max_iterations,
+                        ralph_dir.display()
+                    );
+                } else {
+                    elog!(
+                        "[ralph] codex exited 0 on iteration {}/{}",
+                        i,
+                        cfg.max_iterations
+                    );
+                }
 
                 // Read the last-message file for the COMPLETE grep.
                 std::fs::read_to_string(&codex_last_message).ok()
@@ -425,6 +458,27 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                 }
 
                 let output = child.wait_with_output().await.ok();
+                // ── SPEC §12 P1: surface tool exit code on every iteration ──
+                // (same rationale as the codex branch — see comment there)
+                let exit_code = output
+                    .as_ref()
+                    .and_then(|o| o.status.code())
+                    .unwrap_or(-1);
+                if exit_code != 0 {
+                    elog!(
+                        "[ralph] claude exited with code {} on iteration {}/{} (stderr mirror at {}/.ralph-stderr.log)",
+                        exit_code,
+                        i,
+                        cfg.max_iterations,
+                        ralph_dir.display()
+                    );
+                } else {
+                    elog!(
+                        "[ralph] claude exited 0 on iteration {}/{}",
+                        i,
+                        cfg.max_iterations
+                    );
+                }
                 output.and_then(|o| String::from_utf8(o.stdout).ok())
             }
             RalphTool::Amp => {
@@ -494,6 +548,27 @@ pub async fn run(cfg: RalphConfig) -> Result<RalphResult, RalphError> {
                 }
 
                 let output = child.wait_with_output().await.ok();
+                // ── SPEC §12 P1: surface tool exit code on every iteration ──
+                // (same rationale as the codex branch — see comment there)
+                let exit_code = output
+                    .as_ref()
+                    .and_then(|o| o.status.code())
+                    .unwrap_or(-1);
+                if exit_code != 0 {
+                    elog!(
+                        "[ralph] amp exited with code {} on iteration {}/{} (stderr mirror at {}/.ralph-stderr.log)",
+                        exit_code,
+                        i,
+                        cfg.max_iterations,
+                        ralph_dir.display()
+                    );
+                } else {
+                    elog!(
+                        "[ralph] amp exited 0 on iteration {}/{}",
+                        i,
+                        cfg.max_iterations
+                    );
+                }
                 output.and_then(|o| String::from_utf8(o.stdout).ok())
             }
         };

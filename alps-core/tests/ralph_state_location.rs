@@ -382,3 +382,135 @@ async fn tool_backend_runs_with_ralph_dir_as_cwd() {
     let _ = fs::remove_dir_all(&script_dir);
     let _ = fs::remove_dir_all(&fake_bin);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// SPEC §12 P1: surface tool exit code + stderr on every Ralph iteration.
+//
+// Acceptance gate from SPEC.md §12 P1:
+//   "a unit test that drives ralph::run with a fake codex that exits 1
+//    with '429 rate_limit_error' on stderr; assert the captured stderr
+//    tail lands in <ralph_dir>/.ralph-stderr.log (which already exists
+//    for the O_APPEND mirror)."
+//
+// This test pins two contracts:
+//   1. The fake codex's stderr output (containing the 429 marker) lands
+//      in <ralph_dir>/.ralph-stderr.log (the O_APPEND mirror still works).
+//   2. Ralph continues iterating after a non-zero exit code (does NOT
+//      treat exit 1 as a fatal orchestrator error — bash's `|| true`
+//      semantics preserved). With max_iterations=2 and a non-completing
+//      codex, .ralph-result.json shows completed=false BUT iterations=2.
+//
+// The exit-code-as-an-`elog!` line is verified visually in the test
+// output (and via subsequent smoke runs); the deterministic check here
+// is the stderr mirror landing the marker on disk.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Fake codex that emits a 429/quota marker on stderr (where real
+/// providers emit quota exhaustion errors) and exits non-zero on every
+/// invocation. Does NOT write a COMPLETE last-message file — Ralph
+/// should not see completion, and the loop should hit max_iterations.
+fn write_fake_codex_quota_exceeded(bin_dir: &Path) {
+    let codex = bin_dir.join("codex");
+    let script = r#"#!/bin/bash
+# Fake codex that exits non-zero with a quota/429 marker on stderr.
+# Mirrors the real provider shape: stderr carries the diagnostic,
+# stdout is empty, exit code is the failure indicator.
+last_message_file=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) last_message_file="$2"; shift 2 ;;
+        *) shift ;;
+    esac
+done
+# Drain stdin so the parent process doesn't block on the pipe.
+cat > /dev/null
+# Emit the quota marker to STDERR (where real codex emits 429/rate_limit).
+echo "Error: 429 rate_limit_error: quota exceeded for current billing period" >&2
+echo "Error: codex is currently rate limited; please retry after window resets" >&2
+# Do NOT write a last-message file with COMPLETE — Ralph should not see completion.
+exit 1
+"#;
+    fs::write(&codex, script).expect("write fake codex quota-exceeded");
+    fs::set_permissions(&codex, PermissionsExt::from_mode(0o755))
+        .expect("chmod fake codex quota-exceeded");
+}
+
+#[tokio::test]
+async fn quota_exceeded_stderr_lands_in_ralph_stderr_log_and_loop_continues() {
+    // SPEC §12 P1 acceptance gate: a 429 on stderr must land in
+    // .ralph-stderr.log so the operator can `grep` for it after the fact.
+    let ralph_dir = mktemp_dir("alps-ralph-test-p1-quota");
+    let script_dir = mktemp_dir("alps-ralph-test-p1-quota-script");
+    let fake_bin = mktemp_dir("alps-ralph-test-p1-quota-bin");
+
+    write_one_story_failing_prd(&ralph_dir);
+    fs::write(
+        ralph_dir.join("AGENTS.md"),
+        "# Ralph agent instructions (fake, for tests)\n",
+    )
+    .expect("write AGENTS.md");
+    write_fake_codex_quota_exceeded(&fake_bin);
+
+    // Max-iter 2 so the test runs fast. With a never-completing codex
+    // and a failing prd, Ralph should NOT claim completion — it should
+    // exhaust its iterations. The exit-code-as-elog + the stderr mirror
+    // together make the failure visible to the operator.
+    let result =
+        run_ralph_with_fake_codex(ralph_dir.clone(), script_dir.clone(), fake_bin.clone(), 2).await;
+
+    // 1. Ralph must NOT claim completion (the codex never wrote
+    //    `<promise>COMPLETE</promise>` to the last-message file, and the
+    //    prd still has US-002 failing). iterations=2 because the loop
+    //    ran the full 2-iteration budget.
+    assert!(
+        !result.completed,
+        "Ralph must NOT claim completion when codex exits non-zero with no COMPLETE signal"
+    );
+    assert_eq!(
+        result.iterations, 2,
+        "Ralph must iterate the full max_iterations budget (the loop continues past non-zero exits, matching bash's `|| true`)"
+    );
+
+    // 2. .ralph-result.json must reflect the same on-disk state.
+    let result_text =
+        fs::read_to_string(ralph_dir.join(".ralph-result.json")).expect("read .ralph-result.json");
+    let parsed: serde_json::Value =
+        serde_json::from_str(&result_text).expect("parse .ralph-result.json");
+    assert_eq!(
+        parsed["completed"],
+        serde_json::json!(false),
+        ".ralph-result.json must show completed=false"
+    );
+    assert_eq!(
+        parsed["iterations"],
+        serde_json::json!(2),
+        ".ralph-result.json must show iterations=2"
+    );
+
+    // 3. The 429 marker from the fake codex's stderr must land in
+    //    <ralph_dir>/.ralph-stderr.log — this is the SPEC §12 P1 load-bearing
+    //    assertion. Without P1, the operator had no way to see *why* the
+    //    iterations failed. With P1, `grep -E '429|quota|rate_limit'
+    //    <ralph_dir>/.ralph-stderr.log` reveals the failure mode.
+    let stderr_log_path = ralph_dir.join(".ralph-stderr.log");
+    assert!(
+        stderr_log_path.exists(),
+        ".ralph-stderr.log must exist (the O_APPEND mirror file was created on the first iteration)"
+    );
+    let stderr_log =
+        fs::read_to_string(&stderr_log_path).expect("read .ralph-stderr.log");
+    assert!(
+        stderr_log.contains("429 rate_limit_error"),
+        "stderr mirror must contain the 429 quota marker emitted by codex, got: {:?}",
+        stderr_log
+    );
+    assert!(
+        stderr_log.contains("quota exceeded"),
+        "stderr mirror must contain the full quota-exceeded error text, got: {:?}",
+        stderr_log
+    );
+
+    let _ = fs::remove_dir_all(&ralph_dir);
+    let _ = fs::remove_dir_all(&script_dir);
+    let _ = fs::remove_dir_all(&fake_bin);
+}
