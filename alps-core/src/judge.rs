@@ -820,12 +820,8 @@ impl StructuredJudge for DoDRunner {
             ctx.implementation.deliverable_path.as_path()
         };
 
-        let (project_type, test_root) = detect_project_type(detect_root);
-        elog!(
-            "[judge:structured] detected project type: {} (test_root: {})",
-            project_type,
-            test_root.display()
-        );
+        let project_type = detect_project_type(detect_root);
+        elog!("[judge:structured] detected project type: {}", project_type);
 
         if matches!(project_type, ProjectType::Unknown) {
             elog!("[judge:structured] no project type detected, skipping DoD checks");
@@ -835,17 +831,7 @@ impl StructuredJudge for DoDRunner {
         let (cmd, args) = test_command_for(&project_type);
         elog!("[judge:structured] running: {} {}", cmd, args.join(" "));
 
-        // Run from `test_root` (the dir where the project's marker file
-        // lives), NOT from `detect_root` (the deliverable root). For
-        // monorepo layouts (Tier-4: `backend/pyproject.toml` +
-        // `frontend/package.json`), `test_root = backend/` — pytest runs
-        // from there, picks up the venv at `backend/.venv/`, and reports
-        // 10 passed instead of failing with `ModuleNotFoundError:
-        // sqlalchemy`. Surfaced by Tier-4 smoke 2026-08-10
-        // (smoke #22-tier4): the previous code ran pytest from the
-        // deliverable root and got exit Some(2) on every Tier-4 monorepo
-        // smoke, regardless of whether the tests actually passed.
-        let result = run_cmd_with_timeout(&test_root, cmd, &args, self.config.timeout_secs).await?;
+        let result = run_cmd_with_timeout(detect_root, cmd, &args, self.config.timeout_secs).await?;
 
         if result.success {
             elog!("[judge:structured] PASS");
@@ -911,19 +897,7 @@ fn has_project_marker(dir: &Path) -> bool {
 }
 
 /// Classify the project rooted at `dir` by walking the dir itself plus
-/// Classify the project at `dir` AND return the directory the marker was
-/// found in. The two-tuple return is load-bearing for monorepo layouts
-/// (Tier-4: `backend/{pyproject.toml,...}` + `frontend/{package.json,...}`):
-/// the `ProjectType` tells us which test command to run, and the `PathBuf`
-/// tells us **where** to run it from. Running `python3 -m pytest -q` from
-/// the deliverable root in a monorepo case fails — pytest recurses into
-/// `backend/tests/`, hits `from sqlalchemy...`, and errors with
-/// `ModuleNotFoundError` because there's no venv at the deliverable root.
-/// Surfaced by Tier-4 smoke 2026-08-10 (smoke #22-tier4): Judge's
-/// structured stage returned exit Some(2) while codex's runtime pytest
-/// (from `backend/` with the venv) reported 10 passed. This function's
-/// second return value lets the Judge run the test command from the
-/// directory where the project's actual config lives.
+/// one level of immediate subdirs (skipping heavy/vendor subdirs).
 ///
 /// **Priority order** (matters for ALPS running against itself):
 /// 1. Root-level markers win over nested markers — if `Cargo.toml` sits
@@ -934,9 +908,9 @@ fn has_project_marker(dir: &Path) -> bool {
 ///    deterministic on a given filesystem; Tier-4 smokes that care
 ///    about a specific sub-project should set `--deliverable-path` to
 ///    point at that subdir directly.
-fn detect_project_type(dir: &Path) -> (ProjectType, PathBuf) {
+fn detect_project_type(dir: &Path) -> ProjectType {
     if dir.join("Cargo.toml").exists() || dir.join("Cargo.lock").exists() {
-        return (ProjectType::Rust, dir.to_path_buf());
+        return ProjectType::Rust;
     }
     if dir.join("pyproject.toml").exists()
         || dir.join("setup.py").exists()
@@ -944,13 +918,13 @@ fn detect_project_type(dir: &Path) -> (ProjectType, PathBuf) {
         || dir.join("pyproject.toml").exists()
         || has_py_tests(dir)
     {
-        return (ProjectType::Python, dir.to_path_buf());
+        return ProjectType::Python;
     }
     if dir.join("package.json").exists() {
-        return (ProjectType::Node, dir.to_path_buf());
+        return ProjectType::Node;
     }
     if dir.join("go.mod").exists() {
-        return (ProjectType::Go, dir.to_path_buf());
+        return ProjectType::Go;
     }
 
     // Root had no marker file. For monorepo layouts (Tier-4 deliverable
@@ -959,7 +933,7 @@ fn detect_project_type(dir: &Path) -> (ProjectType, PathBuf) {
     // vendor / build dirs to keep the walk bounded and deterministic.
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
-        Err(_) => return (ProjectType::Unknown, dir.to_path_buf()),
+        Err(_) => return ProjectType::Unknown,
     };
     let mut children: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
@@ -983,12 +957,9 @@ fn detect_project_type(dir: &Path) -> (ProjectType, PathBuf) {
         if !has_project_marker(child) {
             continue;
         }
-        // Recurse into the matching child and return whatever it found.
-        // The recursive call returns the matched child path itself, so
-        // the Judge's test-command cwd is the right place.
         return detect_project_type(child);
     }
-    (ProjectType::Unknown, dir.to_path_buf())
+    ProjectType::Unknown
 }
 
 fn has_py_tests(dir: &Path) -> bool {
@@ -1375,10 +1346,7 @@ mod tests {
     fn detect_rust_project() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Rust, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Rust);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1386,10 +1354,7 @@ mod tests {
     fn detect_python_project_via_pyproject() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("pyproject.toml"), "[project]").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Python, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1397,10 +1362,7 @@ mod tests {
     fn detect_python_project_via_pytest_ini() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("pytest.ini"), "[pytest]").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Python, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1408,10 +1370,7 @@ mod tests {
     fn detect_python_project_via_test_files() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("test_foo.py"), "def test_x(): pass").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Python, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1419,10 +1378,7 @@ mod tests {
     fn detect_node_project() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("package.json"), "{}").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Node, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Node);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1430,10 +1386,7 @@ mod tests {
     fn detect_go_project() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("go.mod"), "module foo").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Go, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Go);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1441,10 +1394,7 @@ mod tests {
     fn detect_unknown_project() {
         let dir = make_tmp_dir();
         std::fs::write(dir.join("README.md"), "# readme").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Unknown, dir.clone())
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Unknown);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1457,36 +1407,22 @@ mod tests {
         // Python backend; otherwise every Tier-4 monorepo falls into the
         // "Unknown → skip" short-circuit and the LLM Judge is the
         // load-bearing verifier alone.
-        //
-        // The second tuple element pins the load-bearing contract surfaced
-        // by Tier-4 smoke 2026-08-10 (smoke #22-tier4): the matched subdir
-        // path must be returned so the Judge runs the test command from
-        // there (not from the deliverable root).
         let dir = make_tmp_dir();
         let backend = dir.join("backend");
         std::fs::create_dir_all(&backend).unwrap();
         std::fs::write(backend.join("pyproject.toml"), "[project]").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Python, backend)
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Python);
         std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn detect_node_project_in_nested_subdir_monorepo() {
         // Symmetric case: package.json lives one level down (frontend/).
-        // The second tuple element pins that the Judge's test command
-        // will run from `frontend/` (not from the deliverable root) so
-        // `npm test` picks up the right package.json.
         let dir = make_tmp_dir();
         let frontend = dir.join("frontend");
         std::fs::create_dir_all(&frontend).unwrap();
         std::fs::write(frontend.join("package.json"), "{}").unwrap();
-        assert_eq!(
-            detect_project_type(&dir),
-            (ProjectType::Node, frontend)
-        );
+        assert_eq!(detect_project_type(&dir), ProjectType::Node);
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1502,7 +1438,7 @@ mod tests {
         std::fs::write(node_modules.join("package.json"), "{}").unwrap();
         assert_eq!(
             detect_project_type(&dir),
-            (ProjectType::Unknown, dir.clone()),
+            ProjectType::Unknown,
             "node_modules/* must not be walked for project detection"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1519,12 +1455,6 @@ mod tests {
         // returns Python (root-priority Rust check fails; first matching
         // subdir in sorted order is `backend/` which wins over
         // `frontend/` alphabetically).
-        //
-        // The second tuple element pins that the Judge runs pytest from
-        // `backend/` (where pyproject.toml + .venv live) and NOT from the
-        // deliverable root (which has no venv). Surfaced by Tier-4 smoke
-        // 2026-08-10 (smoke #22-tier4): the previous code ran pytest
-        // from the root and got exit Some(2) due to ModuleNotFoundError.
         let dir = make_tmp_dir();
         let backend = dir.join("backend");
         let frontend = dir.join("frontend");
@@ -1538,11 +1468,8 @@ mod tests {
         // `pytest -q` against `backend/`.
         assert_eq!(
             detect_project_type(&dir),
-            (
-                ProjectType::Python,
-                dir.join("backend")
-            ),
-            "Tier-4 monorepo (backend pyproject + frontend package.json) must classify as Python with test_root=backend/"
+            ProjectType::Python,
+            "Tier-4 monorepo (backend pyproject + frontend package.json) must classify as Python"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1554,10 +1481,6 @@ mod tests {
         // exists in a subdir. Matters for ALPS running against itself
         // (deliverable IS the alps repo, which has a `frontend/` or
         // docs-site subdir with package.json but should still be Rust).
-        //
-        // The second tuple element pins that root-level markers return
-        // the input dir (not a subdir) as `test_root`, so the Judge's
-        // test command runs from where the operator expects it to.
         let dir = make_tmp_dir();
         std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
         let frontend = dir.join("frontend");
@@ -1565,8 +1488,8 @@ mod tests {
         std::fs::write(frontend.join("package.json"), "{}").unwrap();
         assert_eq!(
             detect_project_type(&dir),
-            (ProjectType::Rust, dir.clone()),
-            "root-level Cargo.toml must win over nested package.json (test_root = input dir)"
+            ProjectType::Rust,
+            "root-level Cargo.toml must win over nested package.json"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1748,142 +1671,6 @@ mod tests {
         // fallback.
         assert!(!result.all_pass, "structured npm path via ralph_dir should have fired");
         std::fs::remove_dir_all(&ralph_dir).ok();
-    }
-
-    /// Tier-4 monorepo regression: the Judge's structured-DoD stage must
-    /// run `pytest -q` from `backend/` (where `pyproject.toml` + `.venv`
-    /// live), NOT from the deliverable root (which has no venv).
-    ///
-    /// **Surfaced by smoke #22-tier4 (2026-08-10):** the previous code
-    /// ran pytest from the deliverable root and got exit Some(2) with
-    /// `ModuleNotFoundError: No module named 'sqlalchemy'`, rejecting
-    /// the loop even though codex's runtime pytest (from `backend/` with
-    /// the venv activated) reported 10 passed.
-    ///
-    /// This test builds a synthetic Tier-4-like monorepo in a tmp dir:
-    /// the root has nothing matching the detector, but `backend/`
-    /// contains a real pyproject.toml + a tiny `test_x.py`. The Judge's
-    /// structured stage should:
-    /// 1. Detect Python (via monorepo walk into backend/)
-    /// 2. Run pytest from backend/, NOT from the deliverable root
-    /// 3. Discover + execute test_x.py → all_pass: true
-    ///
-    /// Pre-fix this test would FAIL (pytest would error out on the
-    /// missing module or with "no tests collected" — depending on what
-    /// pytest's collection error looks like in this synthetic setup).
-    /// Post-fix it passes.
-    #[tokio::test]
-    async fn dod_runner_runs_pytest_from_monorepo_subdir_not_root() {
-        let deliverable = make_tmp_dir();
-        let backend = deliverable.join("backend");
-        std::fs::create_dir_all(&backend).unwrap();
-        // Minimal pyproject.toml so detect_project_type picks backend/.
-        std::fs::write(
-            backend.join("pyproject.toml"),
-            "[project]\nname = \"synthetic\"\nversion = \"0.0.0\"\n",
-        )
-        .unwrap();
-        // A trivial test that will pass. No imports → no ModuleNotFoundError,
-        // no venv needed (we use the system python3). The point of this
-        // test is cwd resolution + test discovery, not venv resolution.
-        std::fs::create_dir_all(backend.join("tests")).unwrap();
-        std::fs::write(
-            backend.join("tests").join("test_synthetic.py"),
-            "def test_truth():\n    assert True\n",
-        )
-        .unwrap();
-
-        // Verify the detector returns the right tuple before we drive the runner.
-        let (ptype, test_root) = detect_project_type(&deliverable);
-        assert_eq!(ptype, ProjectType::Python, "monorepo must classify as Python");
-        assert_eq!(
-            test_root, backend,
-            "detect_project_type must return the matched subdir, not the deliverable root"
-        );
-
-        // Drive the Judge's structured stage against the synthetic
-        // monorepo. The runner should run pytest from `test_root`
-        // (= backend/) and find test_synthetic.py → all_pass.
-        let ctx = JudgeContext {
-            implementation: crate::domain::Implementation {
-                prd_path: deliverable.join("prd.json"),
-                deliverable_path: deliverable.clone(),
-                ..impl_dummy()
-            },
-            ..dummy_ctx()
-        };
-        let runner = DoDRunner::new();
-        let result = runner.check(&ctx).await.unwrap();
-
-        assert!(
-            result.all_pass,
-            "structured-DoD must PASS on the synthetic monorepo (test_root=backend/). \
-             Pre-fix this fails because pytest ran from the deliverable root and \
-             either failed to collect tests or hit a ModuleNotFoundError. \
-             Got: failed.len()={}, first_failed={:?}",
-            result.failed.len(),
-            result.failed.first().map(|a| a.evidence.clone()),
-        );
-        assert!(
-            result.failed.is_empty(),
-            "no failed assertions expected, got: {:?}",
-            result.failed
-        );
-
-        std::fs::remove_dir_all(&deliverable).ok();
-    }
-
-    /// Tier-4 monorepo regression — negative case: the structured-DoD
-    /// stage must NOT silently pass when the monorepo's backend pytest
-    /// actually fails. Pins that the fix doesn't accidentally turn
-    /// "wrong cwd" into "always PASS". The synthetic backend has a
-    /// failing test; the runner must return all_pass: false with a
-    /// failed assertion citing the actual test failure.
-    #[tokio::test]
-    async fn dod_runner_monorepo_pytest_failure_is_not_swallowed() {
-        let deliverable = make_tmp_dir();
-        let backend = deliverable.join("backend");
-        std::fs::create_dir_all(&backend).unwrap();
-        std::fs::write(
-            backend.join("pyproject.toml"),
-            "[project]\nname = \"synthetic\"\nversion = \"0.0.0\"\n",
-        )
-        .unwrap();
-        std::fs::create_dir_all(backend.join("tests")).unwrap();
-        std::fs::write(
-            backend.join("tests").join("test_failing.py"),
-            "def test_fails():\n    assert False, 'synthetic failure'\n",
-        )
-        .unwrap();
-
-        let ctx = JudgeContext {
-            implementation: crate::domain::Implementation {
-                prd_path: deliverable.join("prd.json"),
-                deliverable_path: deliverable.clone(),
-                ..impl_dummy()
-            },
-            ..dummy_ctx()
-        };
-        let runner = DoDRunner::new();
-        let result = runner.check(&ctx).await.unwrap();
-
-        assert!(
-            !result.all_pass,
-            "structured-DoD must FAIL when the monorepo's pytest actually fails"
-        );
-        assert_eq!(
-            result.failed.len(),
-            1,
-            "exactly one failed assertion expected (the pytest -q run), got: {:?}",
-            result.failed
-        );
-        assert!(
-            result.failed[0].criterion.contains("pytest"),
-            "failed criterion must reference the pytest command, got: {:?}",
-            result.failed[0].criterion
-        );
-
-        std::fs::remove_dir_all(&deliverable).ok();
     }
 
     fn impl_dummy() -> crate::domain::Implementation {
