@@ -811,6 +811,185 @@ mod tests {
     }
 
     // ─────────────────────────────────────────────────────────────────────
+    // Multi-iteration reject→reject→pass test.
+    //
+    // The single-iter happy-path tests above pin "first try passes."
+    // The existing drive_rejects_then_passes_appends_feedback_to_next_plan
+    // pins "one reject, feedback reaches iter 2's Plan." What neither
+    // pins is the **cross-iteration accumulation** contract:
+    //
+    //   1. AGENTS.md content from prior implement runs reaches the
+    //      NEXT Plan call (not just the immediately-prior Plan).
+    //   2. Each Plan call sees the LATEST feedback, not stale feedback
+    //      from earlier rejects.
+    //   3. Three Plan calls produce three Plan prompts, all distinct,
+    //      with AGENTS.md content monotonically growing across calls.
+    //
+    // This is the load-bearing contract for multi-iter runs where
+    // each iteration's implement discovers new project conventions —
+    // they MUST accumulate into the prompt that drives Plan on retry.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn drive_rejects_twice_then_passes_accumulates_agents_md() {
+        // ── Setup ──
+        let (task, workspace, workspace_root, task_id) = fresh_workspace_task();
+
+        // Plan records its input prompt verbatim so we can verify each
+        // iteration's prompt is distinct + carries the accumulated state.
+        let plan_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let plan_calls_for_closure = plan_calls.clone();
+        let plan_id = PlanId(uuid::Uuid::new_v4());
+        let plan_id_for_closure = plan_id.clone();
+        let plan = PlanAgent::for_test(move |input: Prompt| -> Result<Plan, crate::plan::PlanError> {
+            plan_calls_for_closure
+                .lock()
+                .unwrap()
+                .push(input.as_str().to_string());
+            Ok(canned_plan(plan_id_for_closure.clone()))
+        });
+
+        // Implement returns a canned Implementation whose deliverable_path
+        // points at a ralph_dir containing a synthetic progress.txt. Each
+        // implement run sees the SAME progress.txt (we only seed once).
+        // This pins the contract: drive() reads ralph's progress.txt AFTER
+        // every implement call, so AGENTS.md grows across iterations even
+        // when ralph's output is static.
+        let prd_path = workspace_root.join("prd.json");
+        let ralph_dir = workspace.ralph_dir();
+        std::fs::create_dir_all(&ralph_dir).unwrap();
+        std::fs::write(
+            ralph_dir.join("progress.txt"),
+            "## Codebase Patterns\n- iter-1-pattern-discovered\n",
+        )
+        .unwrap();
+        let implement = ImplementAgent::for_test(workspace_root.clone(), move |_plan: Plan| {
+            Ok(canned_implementation(prd_path.clone()))
+        });
+
+        let review = ReviewAgent::for_test(|_ctx: ReviewContext| -> Result<Review, crate::review::ReviewError> {
+            Ok(canned_review())
+        });
+
+        // Judge: two rejects, then a pass.
+        let pass_receipts = Receipts {
+            task_id: task_id.clone(),
+            plan_id,
+            plan_summary: "Build the requested Python function".to_string(),
+            implement_metrics: ImplementMetrics::default(),
+            review_summary: ReviewSummary {
+                findings_count: 1,
+                critical_findings: 0,
+                assertions_passed: 1,
+                assertions_total: 1,
+            },
+            judged_at: chrono::Utc::now(),
+            judge_model: "mock".to_string(),
+        };
+        let reject_1 = Feedback {
+            reason: "iter-1 rejection: tests do not pass".to_string(),
+            failed_assertions: vec![Assertion {
+                criterion: "tests pass with pytest".to_string(),
+                passed: false,
+                evidence: "iter-1 evidence".to_string(),
+            }],
+            retry_hints: vec!["iter-1 hint: fix the implementation".to_string()],
+        };
+        let reject_2 = Feedback {
+            reason: "iter-2 rejection: tests still failing".to_string(),
+            failed_assertions: vec![Assertion {
+                criterion: "tests pass with pytest".to_string(),
+                passed: false,
+                evidence: "iter-2 evidence".to_string(),
+            }],
+            retry_hints: vec!["iter-2 hint: refactor the recursion".to_string()],
+        };
+        let scripted = Arc::new(ScriptedLlmJudge::new(vec![
+            Judgment::Reject(reject_1),
+            Judgment::Reject(reject_2),
+            Judgment::Pass(pass_receipts),
+        ]));
+        let judge = judge_agent_with(scripted.clone());
+
+        // ── Run ──
+        let result = drive(task, &plan, &implement, &review, &judge, &workspace).await;
+
+        // Capture AGENTS.md BEFORE cleanup so we can assert its contents.
+        let ag = agents_md::read(&workspace_root).unwrap_or_default();
+        let _ = fs::remove_dir_all(&workspace_root);
+
+        // ── Assert 1: drive() returned Ok(done) after 3 iterations ──
+        let _done = result.expect(
+            "drive() should return Ok after reject→reject→pass cycle"
+        );
+
+        // ── Assert 2: Plan/Review/Judge each called exactly 3 times ──
+        let plan_inputs = plan_calls.lock().unwrap();
+        assert_eq!(
+            plan_inputs.len(),
+            3,
+            "Plan should be called once per outer iteration"
+        );
+        assert_eq!(
+            scripted.call_count(),
+            3,
+            "Judge should be called once per outer iteration"
+        );
+
+        // ── Assert 3: iter-2 Plan's prompt contains iter-1's feedback ──
+        assert!(
+            plan_inputs[1].contains("iter-1 rejection"),
+            "iter-2 Plan's prompt should contain iter-1's feedback, got: {}",
+            plan_inputs[1]
+        );
+        assert!(
+            plan_inputs[1].contains("iter-1 hint"),
+            "iter-2 Plan's prompt should contain iter-1's retry hint, got: {}",
+            plan_inputs[1]
+        );
+
+        // ── Assert 4: iter-3 Plan's prompt contains iter-2's feedback (latest) ──
+        //    AND iter-1's feedback (accumulated via rejected.reset()).
+        assert!(
+            plan_inputs[2].contains("iter-2 rejection"),
+            "iter-3 Plan's prompt should contain iter-2's feedback, got: {}",
+            plan_inputs[2]
+        );
+        assert!(
+            plan_inputs[2].contains("iter-2 hint"),
+            "iter-3 Plan's prompt should contain iter-2's retry hint, got: {}",
+            plan_inputs[2]
+        );
+        // Iter-1's feedback should ALSO be in iter-3's prompt — drive()
+        // accumulates feedback across iterations via rejected.reset().
+        assert!(
+            plan_inputs[2].contains("iter-1 rejection"),
+            "iter-3 Plan's prompt should accumulate iter-1's feedback, got: {}",
+            plan_inputs[2]
+        );
+
+        // ── Assert 5: each Plan prompt is distinct (no aliasing) ──
+        assert_ne!(plan_inputs[0], plan_inputs[1], "iter-1 and iter-2 prompts should differ");
+        assert_ne!(plan_inputs[1], plan_inputs[2], "iter-2 and iter-3 prompts should differ");
+        assert_ne!(plan_inputs[0], plan_inputs[2], "iter-1 and iter-3 prompts should differ");
+
+        // ── Assert 6: iter-1 Plan's prompt does NOT contain feedback ──
+        assert!(
+            !plan_inputs[0].contains("Previous attempt rejected")
+                && !plan_inputs[0].contains("iter-1 rejection"),
+            "iter-1 Plan's prompt should NOT contain feedback from prior attempts"
+        );
+
+        // ── Assert 7: AGENTS.md contains the ralph-discovered pattern ──
+        //    (propagate_ralph_patterns ran after each implement call.)
+        assert!(
+            ag.contains("iter-1-pattern-discovered"),
+            "AGENTS.md should accumulate ralph's pattern across iterations, got: {:?}",
+            ag
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
     // error-propagation tests — the bookends. The reject-path handles
     // Resubmit; these handle the case where an agent itself errors.
     //
