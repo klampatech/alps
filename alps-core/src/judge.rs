@@ -1750,6 +1750,50 @@ mod tests {
         std::fs::remove_dir_all(&ralph_dir).ok();
     }
 
+    /// Helper: probe the system for pytest availability. The integration
+    /// tests below exercise the Judge's `python3 -m pytest -q` codepath
+    /// — if pytest isn't installed on the host (CI's ubuntu-latest
+    /// runner doesn't ship with it), the Judge's structured stage exits
+    /// with "No module named pytest" (exit Some(2)) which would mask the
+    /// actual cwd bug we're trying to pin. We skip these tests on hosts
+    /// without pytest to keep CI green; the underlying cwd bug is still
+    /// pinned by `detect_monorepo_returns_backend_as_test_root` (always
+    /// runs in any environment — pure data, no pytest needed).
+    fn pytest_available() -> bool {
+        std::process::Command::new("python3")
+            .args(["-c", "import pytest"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Tier-4 monorepo regression (data-only): the detector must return
+    /// the matched subdir path. This test runs in any environment — no
+    /// pytest required — and pins the load-bearing contract surfaced by
+    /// Tier-4 smoke 2026-08-10 (smoke #22-tier4 + smoke #24-baseline):
+    /// `detect_project_type(deliverable_root)` returns
+    /// `(ProjectType::Python, deliverable_root/backend)` so the Judge
+    /// runs pytest from `backend/`, not from the deliverable root.
+    #[test]
+    fn detect_monorepo_returns_backend_as_test_root() {
+        let dir = make_tmp_dir();
+        let backend = dir.join("backend");
+        let frontend = dir.join("frontend");
+        std::fs::create_dir_all(&backend).unwrap();
+        std::fs::create_dir_all(&frontend).unwrap();
+        std::fs::write(backend.join("pyproject.toml"), "[project]").unwrap();
+        std::fs::write(frontend.join("package.json"), "{}").unwrap();
+
+        let (ptype, test_root) = detect_project_type(&dir);
+        assert_eq!(ptype, ProjectType::Python);
+        assert_eq!(
+            test_root, backend,
+            "test_root must be the matched subdir, not the deliverable root"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Tier-4 monorepo regression: the Judge's structured-DoD stage must
     /// run `pytest -q` from `backend/` (where `pyproject.toml` + `.venv`
     /// live), NOT from the deliverable root (which has no venv).
@@ -1774,6 +1818,24 @@ mod tests {
     /// Post-fix it passes.
     #[tokio::test]
     async fn dod_runner_runs_pytest_from_monorepo_subdir_not_root() {
+        // CI-safety guard: this test exercises the Judge's
+        // `python3 -m pytest -q` codepath. CI's ubuntu-latest runner
+        // doesn't ship pytest, so the command would fail with
+        // `No module named pytest` (exit Some(2)) regardless of whether
+        // the cwd bug is fixed — masking the actual regression we're
+        // trying to pin. Skip the test on hosts without pytest; the
+        // underlying cwd bug is still pinned by the
+        // `detect_monorepo_returns_backend_as_test_root` data-only test
+        // (always runs in any environment).
+        if !pytest_available() {
+            eprintln!(
+                "skipping: pytest not importable on this host. \
+                 The cwd-fix contract is pinned by the data-only test \
+                 detect_monorepo_returns_backend_as_test_root."
+            );
+            return;
+        }
+
         let deliverable = make_tmp_dir();
         let backend = deliverable.join("backend");
         std::fs::create_dir_all(&backend).unwrap();
@@ -1841,6 +1903,20 @@ mod tests {
     /// failed assertion citing the actual test failure.
     #[tokio::test]
     async fn dod_runner_monorepo_pytest_failure_is_not_swallowed() {
+        // CI-safety guard: see pytest_available() in
+        // dod_runner_runs_pytest_from_monorepo_subdir_not_root. Skip on
+        // hosts without pytest; the negative-case contract is covered by
+        // the existing dod_runner_detect_uses_*_at_deliverable_path
+        // tests on hosts where pytest isn't available.
+        if !pytest_available() {
+            eprintln!(
+                "skipping: pytest not importable on this host. \
+                 Negative-case contract covered by existing \
+                 dod_runner_detect_uses_*_at_deliverable_path tests."
+            );
+            return;
+        }
+
         let deliverable = make_tmp_dir();
         let backend = deliverable.join("backend");
         std::fs::create_dir_all(&backend).unwrap();
