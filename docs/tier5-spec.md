@@ -354,4 +354,16 @@ If Tier 5 reveals that the smoke-26 pattern is brittle (the wrapper
 itself dies on certain shell signals, etc.), P7 re-opens with a more
 substantive fix.
 
+## Smoke runner follow-ups (Tier-5 #1 run surfaced)
+
+The runner proved out structurally (smoke converged at 8256s with 6144s budget remaining; sentinel-detection path fired; no `herdr wait` in the loop). Three quality-of-life bugs surfaced that should be patched before Tier-6 reuses the runner:
+
+1. **Double-fire guard.** First-run footgun: launching the runner in a foreground `terminal(background=false)` then letting `terminal`'s timeout kill the bash wrapper leaves the herdr pane + alps instance alive (the wrapper inside the pane keeps running its own monitor loop, not coupled to the parent bash). Re-firing the runner creates a *second* herdr workspace + a *second* alps competing on the same workdir. **Fix candidate:** add a `--smoke-number`-based singleton guard — check `/tmp/<log-prefix>-runner.lock` (touch + flock) at startup; if held by another live PID, exit 2 with a clear "smoke #N already in progress (pid=XXXX, alps_pid=YYYY); use --force to override" message. Reference: this happened on the Tier-5 #1 run; I caught it from the duplicate `wrapper started` lines in the meta log and C-c'd the orphan pane by hand.
+
+2. **Cosmetic `accepts=` / `rejects=` counter formatting.** Runner's grep-telemetry line counts end up as `accepts=0\n0 rejects=4` in the stdout (the count is split across lines because the awk pipeline emits a trailing line separator). Fix: replace `grep -c "..." | echo 0` with `grep -c "..." || true` so a zero match produces a clean integer. Receipts.json is the source of truth for accept/reject counts; the runner's stdout is just operator-facing status.
+
+3. **Wrapper meta-log "smoke complete" detection is dead code in the natural-exit path.** The runner checks for `\\[smoke${N}-wrapper .*\\] smoke #${N} complete$` in the meta log, but the canonical Tier-N wrapper (`/tmp/alps-tier4-smoke-wrapper.sh`) only writes that line on the budget-kill path — the natural-exit path writes the "receipts preserved" block and exits silently. Convergence always comes from the `.alps-last-done` sentinel check. **Fix candidate:** either (a) add the "smoke complete" line to the wrapper's natural-exit path (single-line patch in `alps-tier4-smoke-wrapper.sh`), or (b) drop the dead-code check from the runner. (a) is the better fix because it gives the runner a third convergence signal for when the sentinel is delayed (e.g., filesystem mtime skew on a tmpfs-backed workdir).
+
+Worth landing all three as a single Tier-5 follow-up PR before firing Tier 6, since Tier 6 will inherit the same runner.
+
 — Evo, 2026-08-11
