@@ -17,6 +17,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use thiserror::Error;
@@ -832,8 +833,12 @@ impl StructuredJudge for DoDRunner {
             return Ok(StructuredResult { all_pass: true, failed: vec![] });
         }
 
-        let (cmd, args) = test_command_for(&project_type);
-        elog!("[judge:structured] running: {} {}", cmd, args.join(" "));
+        let (cmd, args) = test_command_for(&project_type, &test_root);
+        let args_str: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();
+        elog!(
+            "[judge:structured] running: {} {}",
+            cmd, args_str.join(" ")
+        );
 
         // Run from `test_root` (the dir where the project's marker file
         // lives), NOT from `detect_root` (the deliverable root). For
@@ -845,7 +850,7 @@ impl StructuredJudge for DoDRunner {
         // (smoke #22-tier4): the previous code ran pytest from the
         // deliverable root and got exit Some(2) on every Tier-4 monorepo
         // smoke, regardless of whether the tests actually passed.
-        let result = run_cmd_with_timeout(&test_root, cmd, &args, self.config.timeout_secs).await?;
+        let result = run_cmd_with_timeout(&test_root, &cmd, &args_str, self.config.timeout_secs).await?;
 
         if result.success {
             elog!("[judge:structured] PASS");
@@ -1006,14 +1011,64 @@ fn has_py_tests(dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn test_command_for(project_type: &ProjectType) -> (&'static str, Vec<&'static str>) {
+fn test_command_for(
+    project_type: &ProjectType,
+    test_root: &Path,
+) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
     match project_type {
-        ProjectType::Rust => ("cargo", vec!["test", "--quiet"]),
-        ProjectType::Python => ("python3", vec!["-m", "pytest", "-q"]),
-        ProjectType::Node => ("npm", vec!["test", "--silent"]),
-        ProjectType::Go => ("go", vec!["test", "./..."]),
-        ProjectType::Unknown => ("", vec![]),
+        ProjectType::Rust => (
+            Cow::Borrowed("cargo"),
+            vec![Cow::Borrowed("test"), Cow::Borrowed("--quiet")],
+        ),
+        ProjectType::Python => python_test_cmd(test_root),
+        ProjectType::Node => (
+            Cow::Borrowed("npm"),
+            vec![Cow::Borrowed("test"), Cow::Borrowed("--silent")],
+        ),
+        ProjectType::Go => (
+            Cow::Borrowed("go"),
+            vec![Cow::Borrowed("test"), Cow::Borrowed("./...")],
+        ),
+        ProjectType::Unknown => (Cow::Borrowed(""), vec![]),
     }
+}
+
+/// Resolve the Python test-command invocation. Prefers the project's
+/// local venv interpreter (`<test_root>/.venv/bin/python` or
+/// `.../venv/bin/python`) when one exists, falls back to system
+/// `python3`. Surfaced by Tier-4 smoke 2026-08-10 (smoke #22-tier4
+/// originally misdiagnosed as a cwd bug; smoke #25 isolated the venv
+/// issue after the cwd fix landed in PR #18 / `6c1fadf`): the Judge's
+/// `python3 -m pytest -q` invocation resolved via `$PATH` to the system
+/// Python, which had no `sqlalchemy` installed; codex's runtime pytest
+/// (via `uv run` or `.venv/bin/python` activated) reported 13 passed.
+/// The deliverable was correct; the Judge's verifier just couldn't see
+/// it. Fall-through (`python3`) preserves pre-P4 behavior for
+/// non-venv projects (e.g., Tier-1 single-dir Python with globally
+/// installed deps).
+fn python_test_cmd(test_root: &Path) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
+    for venv_subdir in [".venv", "venv"] {
+        let venv_python = test_root.join(venv_subdir).join("bin/python");
+        if venv_python.exists() {
+            return (
+                Cow::Owned(venv_python.to_string_lossy().into_owned()),
+                vec![
+                    Cow::Borrowed("-m"),
+                    Cow::Borrowed("pytest"),
+                    Cow::Borrowed("-q"),
+                ],
+            );
+        }
+    }
+    // No venv → fall back to system `python3 -m pytest -q`.
+    (
+        Cow::Borrowed("python3"),
+        vec![
+            Cow::Borrowed("-m"),
+            Cow::Borrowed("pytest"),
+            Cow::Borrowed("-q"),
+        ],
+    )
 }
 
 struct CmdResult {
@@ -1591,11 +1646,132 @@ mod tests {
 
     #[test]
     fn test_command_for_each_type() {
-        assert_eq!(test_command_for(&ProjectType::Rust), ("cargo", vec!["test", "--quiet"]));
-        assert_eq!(test_command_for(&ProjectType::Python), ("python3", vec!["-m", "pytest", "-q"]));
-        assert_eq!(test_command_for(&ProjectType::Node), ("npm", vec!["test", "--silent"]));
-        assert_eq!(test_command_for(&ProjectType::Go), ("go", vec!["test", "./..."]));
-        assert_eq!(test_command_for(&ProjectType::Unknown), ("", vec![]));
+        // Synthesize a test_root with NO .venv/ so the Python arm
+        // returns the system `python3` fallback (preserving pre-P4
+        // behavior for Tier-1 single-dir Python projects).
+        let tmp = make_tmp_dir();
+        assert_eq!(
+            test_command_for(&ProjectType::Rust, &tmp),
+            (
+                Cow::Borrowed("cargo"),
+                vec![Cow::Borrowed("test"), Cow::Borrowed("--quiet")]
+            )
+        );
+        assert_eq!(
+            test_command_for(&ProjectType::Python, &tmp),
+            (
+                Cow::Borrowed("python3"),
+                vec![
+                    Cow::Borrowed("-m"),
+                    Cow::Borrowed("pytest"),
+                    Cow::Borrowed("-q")
+                ]
+            )
+        );
+        assert_eq!(
+            test_command_for(&ProjectType::Node, &tmp),
+            (
+                Cow::Borrowed("npm"),
+                vec![Cow::Borrowed("test"), Cow::Borrowed("--silent")]
+            )
+        );
+        assert_eq!(
+            test_command_for(&ProjectType::Go, &tmp),
+            (
+                Cow::Borrowed("go"),
+                vec![Cow::Borrowed("test"), Cow::Borrowed("./...")]
+            )
+        );
+        assert_eq!(
+            test_command_for(&ProjectType::Unknown, &tmp),
+            (Cow::Borrowed(""), vec![] as Vec<Cow<'static, str>>)
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P4 acceptance gate 1: when `<test_root>/.venv/bin/python` exists,
+    /// `test_command_for` returns the absolute venv path so the Judge
+    /// uses the venv's interpreter (which has sqlalchemy etc.). When
+    /// only `<test_root>/venv/bin/python` exists, that one wins. When
+    /// neither exists, falls back to `python3`. Surfaced by Tier-4
+    /// smoke 2026-08-10: cwd fix in PR #18 made the cwd right but
+    /// pytest still failed with `ModuleNotFoundError: sqlalchemy`
+    /// because `Command::new("python3")` resolved via PATH to the
+    /// system Python.
+    #[test]
+    fn test_command_for_python_uses_venv_python_when_venv_exists() {
+        let tmp = make_tmp_dir();
+        let venv_dir = tmp.join(".venv");
+        let venv_bin = venv_dir.join("bin");
+        std::fs::create_dir_all(&venv_bin).unwrap();
+        // Just an existing-file stub; we never invoke it. The function
+        // checks for existence, not exec-ability.
+        std::fs::write(venv_bin.join("python"), "").unwrap();
+
+        let venv_path: PathBuf = venv_dir.join("bin/python");
+        let (cmd, args) = test_command_for(&ProjectType::Python, &tmp);
+        let expected: Cow<'static, str> =
+            Cow::Owned(venv_path.to_string_lossy().into_owned());
+        assert_eq!(
+            cmd, expected,
+            "Python arm should resolve to <test_root>/.venv/bin/python when present"
+        );
+        assert_eq!(
+            args,
+            vec![
+                Cow::Borrowed("-m"),
+                Cow::Borrowed("pytest"),
+                Cow::Borrowed("-q")
+            ]
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P4 acceptance gate 1 (negative): `.venv/bin/python` is checked
+    /// before `venv/bin/python` (priority order matters: `.venv` is
+    /// the `uv` default, `venv` is the stdlib `python -m venv`
+    /// default; the vast majority of python projects in this codebase
+    /// use `.venv`).
+    #[test]
+    fn test_command_for_python_prefers_dotvenv_over_venv() {
+        let tmp = make_tmp_dir();
+        // Create both, then assert `.venv` wins.
+        for venv_subdir in [".venv", "venv"] {
+            let bin = tmp.join(venv_subdir).join("bin");
+            std::fs::create_dir_all(&bin).unwrap();
+            std::fs::write(bin.join("python"), "").unwrap();
+        }
+        let (cmd, _) = test_command_for(&ProjectType::Python, &tmp);
+        assert!(
+            cmd.contains(".venv/bin/python"),
+            "expected `.venv` to win over `venv`, got: {cmd}"
+        );
+        assert!(
+            !cmd.contains("/venv/bin/python"),
+            "non-dot variant should not appear, got: {cmd}"
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// P4 acceptance gate 2: no venv → fall back to system `python3`.
+    /// Preserves pre-P4 behavior for single-dir Python projects that
+    /// rely on globally-installed deps (e.g., `pip install pytest`
+    /// outside of a venv).
+    #[test]
+    fn test_command_for_python_falls_back_to_python3_when_no_venv() {
+        let tmp = make_tmp_dir();
+        // No .venv or venv subdirs; just a plain dir.
+        let (cmd, args) = test_command_for(&ProjectType::Python, &tmp);
+        assert_eq!(cmd, Cow::Borrowed("python3"));
+        assert_eq!(
+            args,
+            vec![
+                Cow::Borrowed("-m"),
+                Cow::Borrowed("pytest"),
+                Cow::Borrowed("-q")
+            ]
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     #[test]

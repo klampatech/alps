@@ -1103,6 +1103,44 @@ Option C is local (no new tooling), has zero new failure modes, and the fix is a
 
 **P4 priority:** higher than P3 for our current work because Tier-4 smokes are unusable end-to-end without it. Lower than P1/P2 because we don't currently hit quota walls (today was the first quota-aware session; we're pre-empting, not patching an active bleed). Recommend: P4 lands before the next Tier-4 smoke that wants a clean `[done] accepted` verdict without codex needing to manually re-invoke pytest for the Judge.
 
+**P4 implementation (lands in same PR as this SPEC entry):** change `fn test_command_for(project_type: &ProjectType) -> (&'static str, Vec<&'static str>)` in `alps-core/src/judge.rs:1009` to:
+
+```rust
+fn test_command_for(
+    project_type: &ProjectType,
+    test_root: &Path,
+) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
+    match project_type {
+        ProjectType::Rust => (Cow::Borrowed("cargo"), vec![Cow::Borrowed("test"), Cow::Borrowed("--quiet")]),
+        ProjectType::Python => python_test_cmd(test_root),
+        ProjectType::Node => (Cow::Borrowed("npm"), vec![Cow::Borrowed("test"), Cow::Borrowed("--silent")]),
+        ProjectType::Go => (Cow::Borrowed("go"), vec![Cow::Borrowed("test"), Cow::Borrowed("./...")]),
+        ProjectType::Unknown => (Cow::Borrowed(""), vec![]),
+    }
+}
+
+fn python_test_cmd(test_root: &Path) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
+    for venv_subdir in [".venv", "venv"] {
+        let venv_python = test_root.join(venv_subdir).join("bin/python");
+        if venv_python.exists() {
+            return (Cow::Owned(venv_python.to_string_lossy().into_owned()),
+                    vec![Cow::Borrowed("-m"), Cow::Borrowed("pytest"), Cow::Borrowed("-q")]);
+        }
+    }
+    (Cow::Borrowed("python3"), vec![Cow::Borrowed("-m"), Cow::Borrowed("pytest"), Cow::Borrowed("-q")])
+}
+```
+
+`Cow<'static, str>` replaces `&'static str` so the venv path (allocated per-call) doesn't need to be leaked via `Box::leak`. Caller line becomes `let (cmd, args) = test_command_for(&project_type, &test_root);`; then `let args_str: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();` to deref the Cows for `run_cmd_with_timeout` (`cmd: &str, args: &[&str]`).
+
+**Tests (in same PR):**
+- Update `test_command_for_each_type` to pass `&test_root` to the function (8 assertions total).
+- New `test_command_for_python_uses_venv_python_when_venv_exists` — synthetic `<dir>/.venv/bin/python` stub; asserts the venv path is returned.
+- New `test_command_for_python_prefers_dotvenv_over_venv` — creates both `.venv/bin/python` and `venv/bin/python`, asserts `.venv` wins (priority order: `.venv` is `uv` default, `venv` is stdlib `python -m venv` default).
+- New `test_command_for_python_falls_back_to_python3_when_no_venv` — no venv dirs, asserts fall-through.
+
+Test count: 180 → 183 (no skip patterns needed; these are pure data-tests, no pytest dependency).
+
 
 
 ### Recently completed (just shipped)
