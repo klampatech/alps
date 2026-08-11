@@ -1753,6 +1753,44 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
+    /// Live check: when the real Tier-4 leftover deliverable is on disk
+    /// (smoke #25's `/tmp/alps-tier4-notes-25/backend/.venv/bin/python`
+    /// — actual cpython 3.12, real symlink, real sqlalchemy),
+    /// `test_command_for` resolves to that exact path. This is the
+    /// cheap signal we run in place of a full Tier-4 smoke to confirm
+    /// the P4 fix works against the real venv it was designed for —
+    /// no LLM calls, no ralph, just the function exercising the actual
+    /// filesystem. Skips if the leftover was cleaned up.
+    ///
+    /// Smoke #25 (2026-08-10) proved the cwd fix landed correctly but
+    /// the Judge still hit `ModuleNotFoundError: sqlalchemy` because
+    /// system `python3` had no deps. This test pins that the P4 fix
+    /// resolves to the venv interpreter on that exact deliverable
+    /// layout.
+    #[test]
+    fn test_command_for_python_resolves_real_tier4_venv() {
+        let real_venv_python =
+            PathBuf::from("/tmp/alps-tier4-notes-25/backend/.venv/bin/python");
+        if !real_venv_python.exists() {
+            eprintln!(
+                "skipping: {real_venv_python:?} not on disk (smoke #25 leftover \
+                 was cleaned up). Tier-4 smokes produce this path; rerun this \
+                 test against any smoke's deliverable to reproduce the check."
+            );
+            return;
+        }
+        let test_root = PathBuf::from("/tmp/alps-tier4-notes-25/backend");
+        let (cmd, _) = test_command_for(&ProjectType::Python, &test_root);
+        let expected: Cow<'static, str> =
+            Cow::Owned(real_venv_python.to_string_lossy().into_owned());
+        assert_eq!(
+            cmd, expected,
+            "P4 venv fix must resolve to the real .venv/bin/python on a \
+             Tier-4 deliverable (not 'python3'). If this fails, the fix \
+             didn't land or the deliverable layout shifted."
+        );
+    }
+
     /// P4 acceptance gate 2: no venv → fall back to system `python3`.
     /// Preserves pre-P4 behavior for single-dir Python projects that
     /// rely on globally-installed deps (e.g., `pip install pytest`
