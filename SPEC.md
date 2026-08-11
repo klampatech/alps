@@ -1051,6 +1051,96 @@ These fixes serve ALPS's primary engineering goal: **continually reduce ambiguou
 
 *Acceptance contract for all three:* none of them weaken the `IncompleteStories` guard, the tool-CWD fix from `74fe9f9`, the wrapper stream separation, or the structured-DoD monorepo walk. All three are additive — strictly more visibility / more safety, no regressions to existing load-bearing behavior.
 
+4. **P4 — Judge venv-aware test invocation (monorepo Python + `.venv`).** Surface: with the cwd fix from PR #18 (`cc800f9` + `6c1fadf`) in place, the Judge's structured-DoD stage correctly runs `python3 -m pytest -q` from `<test_root>/backend/` (where the marker file `pyproject.toml` lives). But `Command::new("python3")` resolves via `$PATH`, which returns the system `/usr/bin/python3` — and the system Python has no `sqlalchemy`. The venv at `<test_root>/backend/.venv/bin/python` has all the deps installed (`sqlalchemy` v2.0.51 confirmed). Result: `ImportError: No module named 'sqlalchemy'` from `tests/conftest.py:18` → exit Some(4) → Judge REJECT → repeat-loop burns quota. **Verified live on 2026-08-10 in smoke #25** (Tier-4 post-PR-#18-merge stability check): log shows `judge:structured] detected project type: python (test_root: /tmp/alps-tier4-notes-25/backend)` ✓ (cwd fix working) but `[judge:structured] FAIL (exit Some(4))` because the venv wasn't activated. codex's runtime pytest (called via `uv run pytest -q` or with `.venv/bin/python` activated) reports 13 passed — so the deliverable is actually fine, the Judge's verifier just can't see it. **Surfaced by:** smoke #22-tier4 (2026-08-10, originally misdiagnosed as a cwd bug), confirmed by smoke #23 + smoke #24-baseline + smoke #25 (the cwd bug and the venv bug are independent). **Why this wasn't caught earlier:** Tier-1 / Tier-2 / Tier-3 don't hit the Python+monorepo+venv triple — Tier-1 is single-dir Python (system pytest on `$PATH`), Tier-2 is Go (`go test .`), Tier-3 is Node (`npm test`). The bug is specific to the (Python + monorepo + .venv) combo. Tier-4 is the first smoke tier that exercises it consistently.
+
+**Fix (Option C — preferred):** change `fn test_command_for(project_type: &ProjectType) -> (&'static str, Vec<&'static str>)` in `alps-core/src/judge.rs:1009` to take a third parameter `test_root: &Path` and resolve Python specially:
+
+```rust
+fn test_command_for(project_type: &ProjectType, test_root: &Path) -> (&'static str, Vec<&'static str>) {
+    match project_type {
+        ProjectType::Rust => ("cargo", vec!["test", "--quiet"]),
+        ProjectType::Python => python_test_cmd(test_root),
+        ProjectType::Node => ("npm", vec!["test", "--silent"]),
+        ProjectType::Go => ("go", vec!["test", "./..."]),
+        ProjectType::Unknown => ("", vec![]),
+    }
+}
+
+fn python_test_cmd(test_root: &Path) -> (&'static str, Vec<&'static str>) {
+    // Prefer the project's local venv if it exists. Operator already
+    // set it up via `uv venv` / `python -m venv .venv` / `uv sync`, so
+    // we should use it.
+    for venv_subdir in [".venv", "venv"] {
+        let venv_python = test_root.join(venv_subdir).join("bin/python");
+        if venv_python.exists() {
+            return (BOX_LEAK, vec!["-m", "pytest", "-q"]);  // leaks a `PathBuf` lifetime-safe str
+        }
+    }
+    // No venv → fall back to system `python3 -m pytest -q` (current behavior,
+    // works for global-install projects like Tier-1 single-dir).
+    ("python3", vec!["-m", "pytest", "-q"])
+}
+```
+
+The caller line in `DoDRunner::check` (currently `let (cmd, args) = test_command_for(&project_type);` at judge.rs:835) becomes `let (cmd, args) = test_command_for(&project_type, &test_root);`. Update the existing 4 `test_command_for_each_type` assertions to pass `&test_root` and assert the new behavior (Python with `.venv` returns the venv path; Python without returns `python3`). Add 2 new unit tests: `test_command_for_python_prefers_venv_when_present` and `test_command_for_python_falls_back_to_python3_when_no_venv`.
+
+**Why Option C over alternative options:**
+
+| Option | Mechanism | Tradeoff |
+|---|---|---|
+| **A — `uv run pytest -q`** | Replace `python3 -m pytest` with `uv run pytest` | Requires `uv` on `$PATH`; fails on legacy Python projects without `pyproject.toml` (e.g., a `setup.py` repo with `pip install --user`). Adds a new tool dependency for the Judge. |
+| **B — Activate `.venv` before `run_cmd_with_timeout`** | `source .venv/bin/activate && python3 -m pytest -q` via a shell wrapper | Shell activation doesn't propagate through `Command::new` — each subprocess needs its own activation, but activation is per-subshell. Adds bash indirection. |
+| **C — Use `<test_root>/.venv/bin/python` directly** ✅ | Resolve the venv interpreter path explicitly | No new tool dep; matches what the operator actually set up (their `.venv/`); clean fall-through for projects without a venv. |
+
+Option C is local (no new tooling), has zero new failure modes, and the fix is a single-file change to `judge.rs`.
+
+**Acceptance gates (test additions):**
+
+1. `test_command_for_python_uses_venv_python_when_venv_exists` — synthetic dir with `<dir>/.venv/bin/python` stub (just an existing file, no exec needed); assert `test_command_for(&ProjectType::Python, &dir)` returns the venv path.
+2. `test_command_for_python_falls_back_to_python3_when_no_venv` — synthetic dir with no `.venv/`; assert it returns `python3`.
+3. `dod_runner_python_with_venv_uses_venv_interpreter` (CI-safe, skip if no system python3) — full end-to-end runner test against a synthetic Python monorepo with a venv; assert the Judge's log shows the venv path AND pytest actually ran from the venv (proven by exit-0 with a trivial `assert True` test inside `backend/tests/`).
+4. The existing `dod_runner_runs_pytest_from_monorepo_subdir_not_root` (already skipped on systems without pytest) still passes — but now without the `ModuleNotFoundError: sqlalchemy` failure on hosts that DO have pytest (because the venv is used).
+
+**P4 priority:** higher than P3 for our current work because Tier-4 smokes are unusable end-to-end without it. Lower than P1/P2 because we don't currently hit quota walls (today was the first quota-aware session; we're pre-empting, not patching an active bleed). Recommend: P4 lands before the next Tier-4 smoke that wants a clean `[done] accepted` verdict without codex needing to manually re-invoke pytest for the Judge.
+
+**P4 implementation (lands in same PR as this SPEC entry):** change `fn test_command_for(project_type: &ProjectType) -> (&'static str, Vec<&'static str>)` in `alps-core/src/judge.rs:1009` to:
+
+```rust
+fn test_command_for(
+    project_type: &ProjectType,
+    test_root: &Path,
+) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
+    match project_type {
+        ProjectType::Rust => (Cow::Borrowed("cargo"), vec![Cow::Borrowed("test"), Cow::Borrowed("--quiet")]),
+        ProjectType::Python => python_test_cmd(test_root),
+        ProjectType::Node => (Cow::Borrowed("npm"), vec![Cow::Borrowed("test"), Cow::Borrowed("--silent")]),
+        ProjectType::Go => (Cow::Borrowed("go"), vec![Cow::Borrowed("test"), Cow::Borrowed("./...")]),
+        ProjectType::Unknown => (Cow::Borrowed(""), vec![]),
+    }
+}
+
+fn python_test_cmd(test_root: &Path) -> (Cow<'static, str>, Vec<Cow<'static, str>>) {
+    for venv_subdir in [".venv", "venv"] {
+        let venv_python = test_root.join(venv_subdir).join("bin/python");
+        if venv_python.exists() {
+            return (Cow::Owned(venv_python.to_string_lossy().into_owned()),
+                    vec![Cow::Borrowed("-m"), Cow::Borrowed("pytest"), Cow::Borrowed("-q")]);
+        }
+    }
+    (Cow::Borrowed("python3"), vec![Cow::Borrowed("-m"), Cow::Borrowed("pytest"), Cow::Borrowed("-q")])
+}
+```
+
+`Cow<'static, str>` replaces `&'static str` so the venv path (allocated per-call) doesn't need to be leaked via `Box::leak`. Caller line becomes `let (cmd, args) = test_command_for(&project_type, &test_root);`; then `let args_str: Vec<&str> = args.iter().map(|s| s.as_ref()).collect();` to deref the Cows for `run_cmd_with_timeout` (`cmd: &str, args: &[&str]`).
+
+**Tests (in same PR):**
+- Update `test_command_for_each_type` to pass `&test_root` to the function (8 assertions total).
+- New `test_command_for_python_uses_venv_python_when_venv_exists` — synthetic `<dir>/.venv/bin/python` stub; asserts the venv path is returned.
+- New `test_command_for_python_prefers_dotvenv_over_venv` — creates both `.venv/bin/python` and `venv/bin/python`, asserts `.venv` wins (priority order: `.venv` is `uv` default, `venv` is stdlib `python -m venv` default).
+- New `test_command_for_python_falls_back_to_python3_when_no_venv` — no venv dirs, asserts fall-through.
+
+Test count: 180 → 183 (no skip patterns needed; these are pure data-tests, no pytest dependency).
+
 
 
 ### Recently completed (just shipped)
