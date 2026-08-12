@@ -354,4 +354,53 @@ If Tier 5 reveals that the smoke-26 pattern is brittle (the wrapper
 itself dies on certain shell signals, etc.), P7 re-opens with a more
 substantive fix.
 
+## Smoke runner follow-ups (Tier-5 #1 run surfaced)
+
+The runner proved out structurally (smoke converged at 8256s with 6144s budget remaining; sentinel-detection path fired; no `herdr wait` in the loop). Three quality-of-life bugs surfaced that should be patched before Tier-6 reuses the runner:
+
+1. **Double-fire guard.** First-run footgun: launching the runner in a foreground `terminal(background=false)` then letting `terminal`'s timeout kill the bash wrapper leaves the herdr pane + alps instance alive (the wrapper inside the pane keeps running its own monitor loop, not coupled to the parent bash). Re-firing the runner creates a *second* herdr workspace + a *second* alps competing on the same workdir. **Fix candidate:** add a `--smoke-number`-based singleton guard — check `/tmp/<log-prefix>-runner.lock` (touch + flock) at startup; if held by another live PID, exit 2 with a clear "smoke #N already in progress (pid=XXXX, alps_pid=YYYY); use --force to override" message. Reference: this happened on the Tier-5 #1 run; I caught it from the duplicate `wrapper started` lines in the meta log and C-c'd the orphan pane by hand.
+
+2. **Cosmetic `accepts=` / `rejects=` counter formatting.** Runner's grep-telemetry line counts end up as `accepts=0\n0 rejects=4` in the stdout (the count is split across lines because the awk pipeline emits a trailing line separator). Fix: replace `grep -c "..." | echo 0` with `grep -c "..." || true` so a zero match produces a clean integer. Receipts.json is the source of truth for accept/reject counts; the runner's stdout is just operator-facing status.
+
+3. **Wrapper meta-log "smoke complete" detection is dead code in the natural-exit path.** The runner checks for `\\[smoke${N}-wrapper .*\\] smoke #${N} complete$` in the meta log, but the canonical Tier-N wrapper (`/tmp/alps-tier4-smoke-wrapper.sh`) only writes that line on the budget-kill path — the natural-exit path writes the "receipts preserved" block and exits silently. Convergence always comes from the `.alps-last-done` sentinel check. **Fix candidate:** either (a) add the "smoke complete" line to the wrapper's natural-exit path (single-line patch in `alps-tier4-smoke-wrapper.sh`), or (b) drop the dead-code check from the runner. (a) is the better fix because it gives the runner a third convergence signal for when the sentinel is delayed (e.g., filesystem mtime skew on a tmpfs-backed workdir).
+
+Worth landing all three as a single Tier-5 follow-up PR before firing Tier 6, since Tier 6 will inherit the same runner.
+
+## Strategic assessment (post-Tier-5 retrospective)
+
+After the Tier-5 #1 smoke converged clean, Kyle asked for an honest assessment of where ALPS stands. Recording it here so future sessions have the framing without re-deriving it.
+
+### What's working
+
+- The orchestrator genuinely takes a high-stakes prompt and turns it into a running, tested deliverable. Tier-5 #1: 7/7 stories, 14/14 review assertions, 4 outer iterations refining toward accept, end-to-end from a markdown spec to a working Axum + sqlx + JWT service with per-user isolation. Not vaporware.
+- The Plan → Ralph → Review → Judge composition is a clean separation of concerns. The type-state machine prevents the failure modes that come from "just string the calls together."
+- Recent hardening (cwd fix, venv-aware Judge, structured-DoD monorepo recursion, receipt discipline) shows the system actually improves when a real defect is found. PR #19 alone, ~30 lines of Rust, unblocked the entire Tier-4 smoke chain.
+- The smoke taxonomy is a real asset. Tier 1 → Tier 5 each prove something distinct; the canonical wrapper pattern means every smoke gets comparable instrumentation for free. The tier5-smoke runner codifies a real lesson (smoke-25's `herdr wait` failure shape) into a structural fix, not a one-line workaround.
+
+### What's not working
+
+1. **Cost ceiling is unbounded.** No real notion of "this smoke is allowed to spend $N." P5 (`--budget` flag) and P6 (tool cooldown on persistent 429) are open. Every smoke burns codex + Judge calls; only stop signal is operator-noticed. P5 + P6 close this.
+
+2. **Judge introspection is shallow.** `claude-opus-4` accepts = canonical signal. But why did it accept? What did the LLM see? `receipts.json` gives a verdict line, not a verdict reason. For a 7/7 / 0-critical smoke that's enough. For a 7/7 / 6-non-critical-findings smoke, it's not clear whether the Judge read the findings or rubber-stamped the test pass. **Highest-leverage follow-up work.** Adds a `verdict_reason` field to receipts + an LLM-as-judge introspection pass that surfaces the Judge's actual reasoning.
+
+3. **Visual/interactive surface is structurally unsupported.** Tier-4 worked around with Playwright + PIL dim-checks; Tier-5 doesn't try (CLI + API only). System proven on categories that don't need visual verification; not proven on categories that do. **Unblocks** any Tier-N smoke that involves UI / canvas / game rendering. Likely a new tier5+ smoke spec on its own.
+
+4. **Operator experience has rough edges.** Double-fire guard missing (smoke-25 orphan pane from this very session is the proof). Runner cosmetic counter bug. P5/P6/P7 are mostly operator-experience items. Correctness is solid; UX is what needs the next round.
+
+5. **Test count is a vanity metric.** 184/184 green. But how many tests exercise the failure modes we actually hit in production? `drive_rejects_twice_then_passes_accumulates_agents_md` is the kind of regression net we need; integration test count doesn't tell us. Trade 50 unit tests for one more integration test that exercises smoke-25's failure shape end-to-end.
+
+### Where it's positioned
+
+Working prototype that has earned its way to the next phase. Not yet a product. The prototype is validated against five progressively harder scenarios. The next phase:
+
+- (a) Cost-bounded execution (P5 + P6) so the operator can run smokes unattended.
+- (b) Richer Judge introspection so we trust the accept verdict.
+- (c) At least one Tier-N smoke that exercises visual/interactive verification end-to-end.
+
+None are alps-core algorithm changes — extensions to existing surface area, mostly in runner/wrapper/Judge-receipt layers.
+
+### Honest one-liner
+
+ALPS is the realest thing I've helped build — but its current ceiling is bounded by the Operator's judgment more than by its own capability, and until we put cost bounds + visual verification + Judge introspection on the *system* side of that line, every smoke is a trust exercise rather than a closed loop.
+
 — Evo, 2026-08-11
