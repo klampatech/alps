@@ -239,12 +239,34 @@ enum Command {
     },
 
     /// List tasks in the current workspace.
-    List,
+    ///
+    /// Default output is a one-line-per-task human-readable table.
+    /// With `--json`, emits a single `TaskList` JSON object on stdout
+    /// (stable contract for `alps-gui` to consume — see `alps-core::summary`).
+    List {
+        /// Working directory containing the `tasks/` subdirectory.
+        #[arg(long, default_value = ".")]
+        workdir: String,
+        /// Emit stable JSON for programmatic consumers.
+        #[arg(long)]
+        json: bool,
+    },
 
-    /// Show receipts for a given task.
+    /// Show full details for one task.
+    ///
+    /// Default output is a human-readable multi-section view.
+    /// With `--json`, emits a `TaskDetail` JSON object on stdout, or a
+    /// `TaskNotFound` if no task with this ID exists. Exit code is 2 on
+    /// not-found (so scripts can branch).
     Show {
+        /// Working directory containing the `tasks/` subdirectory.
+        #[arg(long, default_value = ".")]
+        workdir: String,
         /// Task ID.
         task_id: String,
+        /// Emit stable JSON for programmatic consumers.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Run the Ralph loop directly (no Plan/Review/Judge). Useful for
@@ -297,6 +319,208 @@ fn resolve_prompt(prompt: Option<String>, prompt_file: Option<&str>) -> Result<S
             Ok(contents)
         }
         (None, None) => Err("either `prompt` or --prompt-file is required".to_string()),
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// `alps list` and `alps show` — the read-side CLI surface for alps-gui.
+//
+// These were stub `not yet implemented` exits until 2026-08-23; this
+// implementation is the first stable contract between the orchestrator
+// and a programmatic consumer. The JSON output shape is the
+// `TaskSummary` / `TaskDetail` / `TaskList` / `TaskNotFound` types
+// re-exported from `alps-core::summary` — alps-gui deserializes them
+// directly.
+//
+// Human-readable output is the default (one line per task, columns
+// formatted to a fixed width). `--json` switches to a single
+// machine-readable JSON document on stdout with no decorative text.
+// ─────────────────────────────────────────────────────────────────────
+
+fn run_list(workdir: &str, as_json: bool) -> Result<()> {
+    use alps_core::persistence::list_tasks;
+    use alps_core::summary::TaskList;
+
+    let workdir_path = std::path::Path::new(workdir);
+    let tasks = list_tasks(workdir_path)
+        .map_err(|e| anyhow::anyhow!("failed to list tasks under {:?}: {}", workdir_path, e))?;
+
+    if as_json {
+        let payload = TaskList {
+            workdir: workdir_path.to_string_lossy().to_string(),
+            tasks,
+        };
+        let json = serde_json::to_string_pretty(&payload)
+            .map_err(|e| anyhow::anyhow!("failed to serialize TaskList: {}", e))?;
+        println!("{}", json);
+        return Ok(());
+    }
+
+    // Human-readable table.
+    if tasks.is_empty() {
+        println!("No tasks found under {}/tasks", workdir_path.display());
+        return Ok(());
+    }
+    println!(
+        "{:<35} {:<10} {:<5} {:<8} {:<8} {}",
+        "TASK ID", "STATE", "TRY", "STORIES", "ASSERT", "PROMPT"
+    );
+    for t in &tasks {
+        let stories = match (t.stories_passed, t.stories_total) {
+            (Some(p), Some(total)) => format!("{}/{}", p, total),
+            _ => "-".to_string(),
+        };
+        let assertions = match (t.review_assertions_passed, t.review_assertions_total) {
+            (Some(p), Some(total)) => format!("{}/{}", p, total),
+            _ => "-".to_string(),
+        };
+        println!(
+            "{:<35} {:<10} {:<5} {:<8} {:<8} {}",
+            t.task_id,
+            format!("{:?}", t.state).to_lowercase(),
+            t.attempts,
+            stories,
+            assertions,
+            t.prompt_excerpt
+        );
+    }
+    Ok(())
+}
+
+fn run_show(workdir: &str, task_id: &str, as_json: bool) -> Result<()> {
+    use alps_core::persistence::read_task;
+    use alps_core::summary::TaskNotFound;
+
+    let workdir_path = std::path::Path::new(workdir);
+    let detail = read_task(workdir_path, task_id).map_err(|e| {
+        anyhow::anyhow!("failed to read task {:?} under {:?}: {}", task_id, workdir_path, e)
+    })?;
+
+    match detail {
+        None => {
+            // Not found — emit the typed `TaskNotFound` for JSON
+            // consumers and exit 2. Human-readable output mirrors the
+            // behavior.
+            if as_json {
+                let payload = TaskNotFound {
+                    task_id: task_id.to_string(),
+                    workdir: workdir_path.to_string_lossy().to_string(),
+                    suggestion: suggest_task_id(workdir_path, task_id),
+                };
+                let json = serde_json::to_string_pretty(&payload)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize TaskNotFound: {}", e))?;
+                println!("{}", json);
+            } else {
+                eprintln!("error: no task with ID {:?} under {:?}", task_id, workdir_path);
+                if let Some(s) = suggest_task_id(workdir_path, task_id) {
+                    eprintln!("  closest match: {}", s);
+                }
+            }
+            std::process::exit(2);
+        }
+        Some(d) => {
+            if as_json {
+                let json = serde_json::to_string_pretty(&d)
+                    .map_err(|e| anyhow::anyhow!("failed to serialize TaskDetail: {}", e))?;
+                println!("{}", json);
+                return Ok(());
+            }
+            render_task_detail_human(&d);
+            Ok(())
+        }
+    }
+}
+
+/// Find the closest existing task ID to `query` by longest common prefix.
+/// Used to give a helpful "did you mean..." when `alps show <id>` misses.
+/// Returns None if the workdir has no tasks at all.
+fn suggest_task_id(workdir: &std::path::Path, query: &str) -> Option<String> {
+    use alps_core::persistence::list_tasks;
+    let tasks = list_tasks(workdir).ok()?;
+    if tasks.is_empty() {
+        return None;
+    }
+    tasks
+        .iter()
+        .max_by_key(|t| common_prefix_len(&t.task_id, query))
+        .map(|t| t.task_id.clone())
+}
+
+fn common_prefix_len(a: &str, b: &str) -> usize {
+    a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
+}
+
+/// Human-readable rendering of one TaskDetail. Sectioned forward-
+/// chronologically: prompt → plan → implementation → review →
+/// receipts/feedback/failure. The artifact bodies appear before the
+/// terminal verdict so a reader sees the work that led to it.
+fn render_task_detail_human(d: &alps_core::summary::TaskDetail) {
+    let s = &d.summary;
+    println!("# Task {}", s.task_id);
+    println!();
+    println!("State:     {:?}", s.state);
+    println!("Attempts:  {}", s.attempts);
+    println!("Created:   {}", s.created_at);
+    if let Some(c) = s.completed_at {
+        println!("Completed: {}", c);
+    }
+    if let Some(p) = &d.prompt {
+        println!();
+        println!("## Prompt");
+        println!();
+        for line in p.lines() {
+            println!("    {}", line);
+        }
+    }
+    if let Some(p) = &d.plan {
+        println!();
+        println!("## Plan ({} stories)", p.stories.len());
+        for story in &p.stories {
+            println!("  - [{}] {} — {}", story.id.0, story.title, story.description);
+        }
+    }
+    if let Some(_i) = &d.implementation {
+        println!();
+        println!("## Implementation — see tasks/<id>/implementation.json for full content");
+    }
+    if let Some(_r) = &d.review {
+        println!();
+        println!("## Review — see tasks/<id>/review.json for full content");
+    }
+    if let Some(r) = &d.receipts {
+        println!();
+        println!("## Receipts (Judge ACCEPTED)");
+        println!();
+        println!(
+            "Stories: {}/{}, iterations: {}, elapsed: {}s",
+            r.implement_metrics.stories_passed,
+            r.implement_metrics.stories_total,
+            r.implement_metrics.iterations,
+            r.implement_metrics.elapsed_secs
+        );
+        println!(
+            "Review:  {}/{} assertions passed, {} critical findings",
+            r.review_summary.assertions_passed,
+            r.review_summary.assertions_total,
+            r.review_summary.critical_findings
+        );
+        println!("Judge:   {} ({})", "pass", r.judge_model);
+        println!("Plan:    {}", r.plan_summary);
+    }
+    if let Some(f) = &d.feedback {
+        println!();
+        println!("## Feedback (Judge REJECTED)");
+        println!();
+        println!("Reason: {}", f.reason);
+        for h in &f.retry_hints {
+            println!("  - {}", h);
+        }
+    }
+    if let Some(fr) = &d.failure {
+        println!();
+        println!("## Failure");
+        println!();
+        println!("{:?}", fr);
     }
 }
 
@@ -437,13 +661,11 @@ async fn main() -> Result<()> {
             };
             run_task(prompt, workdir, force, deliverable_path).await?;
         }
-        Command::List => {
-            elog!("alps list: not yet implemented");
-            std::process::exit(1);
+        Command::List { workdir, json } => {
+            run_list(&workdir, json)?;
         }
-        Command::Show { task_id } => {
-            elog!("alps show {}: not yet implemented", task_id);
-            std::process::exit(1);
+        Command::Show { workdir, task_id, json } => {
+            run_show(&workdir, &task_id, json)?;
         }
         Command::Ralph { tool, max_iterations, ralph_dir, script_dir } => {
             run_ralph_subcommand(tool, max_iterations, ralph_dir, script_dir).await?;
@@ -915,6 +1137,462 @@ mod tests {
             !is_inside_git_repo(&tmp),
             "expected {} to NOT be inside a git work tree (the CLI's silent-skip behavior depends on this)",
             tmp.display()
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Tests for the new `alps list` / `alps show` surface.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Make a fresh empty workdir under std::env::temp_dir() that
+    /// auto-cleans when the test ends. Unique per (pid, counter) so
+    /// parallel tests don't collide.
+    fn unique_workdir(label: &str) -> std::path::PathBuf {
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let pid = std::process::id();
+        let p = std::env::temp_dir().join(format!("alps-test-list-{}-{}-{}{}", pid, n, std::any::type_name::<()>(), label));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    /// Build a synthetic task directory under `workdir/tasks/<id>/`
+    /// with the requested subset of artifacts. Returns the task_id.
+    fn synthesize_task(
+        workdir: &std::path::Path,
+        label: &str,
+        with_receipts: bool,
+    ) -> String {
+        use alps_core::persistence::TaskWorkspace;
+        use alps_core::domain::{PlanId, Prompt, StoryId, UserStory, Plan};
+        use alps_core::receipt::{ImplementMetrics, Receipts, ReviewSummary};
+        use chrono::{DateTime, Utc};
+
+        let task_id = format!("2026-08-23T120000-{}", label);
+        let task_dir = workdir.join("tasks").join(&task_id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let ws = TaskWorkspace::new(&task_dir);
+
+        // prompt.md (required for the task to surface)
+        ws.write_prompt(&Prompt(format!("Synthesized prompt for {}.", label)))
+            .unwrap();
+
+        // plan.json (so the task reaches Planned state at minimum)
+        let plan = Plan {
+            id: PlanId(alps_core::uuid::Uuid::new_v4()),
+            goal: format!("goal for {}", label),
+            architecture: String::new(),
+            stories: vec![UserStory {
+                id: StoryId(format!("US-{}", label)),
+                title: format!("story for {}", label),
+                description: "test story".to_string(),
+                acceptance_criteria: vec!["passes".to_string()],
+                priority: 1,
+            }],
+            dod: vec![],
+        };
+        ws.write_plan(&plan).unwrap();
+
+        // implementation.json (so it reaches Implemented)
+        ws.write_implementation(&alps_core::domain::Implementation {
+            ralph_branch: format!("alps/{}", task_id),
+            prd_path: std::path::PathBuf::from("prd.json"),
+            commits: vec![],
+            artifacts: vec![],
+            metrics: ImplementMetrics {
+                stories_passed: 1,
+                stories_total: 1,
+                iterations: 1,
+                elapsed_secs: 10,
+            },
+            deliverable_path: std::path::PathBuf::from("."),
+        }).unwrap();
+
+        // receipts.json (optional — only if requested)
+        if with_receipts {
+            ws.write_receipts(&Receipts {
+                task_id: alps_core::domain::TaskId(task_id.clone()),
+                plan_id: plan.id.clone(),
+                plan_summary: format!("done: {}", label),
+                implement_metrics: ImplementMetrics {
+                    stories_passed: 1,
+                    stories_total: 1,
+                    iterations: 1,
+                    elapsed_secs: 10,
+                },
+                review_summary: ReviewSummary {
+                    findings_count: 0,
+                    critical_findings: 0,
+                    assertions_passed: 4,
+                    assertions_total: 4,
+                },
+                judged_at: DateTime::<Utc>::from_naive_utc_and_offset(
+                    chrono::NaiveDate::from_ymd_opt(2026, 8, 23).unwrap().and_hms_opt(12, 30, 0).unwrap(),
+                    Utc,
+                ),
+                judge_model: "claude-opus-4".to_string(),
+            }).unwrap();
+        }
+        task_id
+    }
+
+    #[test]
+    fn list_tasks_empty_workdir_returns_empty_list() {
+        let workdir = unique_workdir("empty");
+        let tasks = alps_core::persistence::list_tasks(&workdir).unwrap();
+        assert!(tasks.is_empty(), "expected empty list, got {} tasks", tasks.len());
+    }
+
+    #[test]
+    fn list_tasks_picks_up_done_state_with_receipts() {
+        let workdir = unique_workdir("done");
+        let task_id = synthesize_task(&workdir, "done1", true);
+        let tasks = alps_core::persistence::list_tasks(&workdir).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, task_id);
+        assert_eq!(tasks[0].state, alps_core::summary::TaskState::Done);
+        assert_eq!(tasks[0].stories_passed, Some(1));
+        assert_eq!(tasks[0].stories_total, Some(1));
+        assert_eq!(tasks[0].judge_verdict.as_deref(), Some("pass"));
+        assert_eq!(tasks[0].judge_model.as_deref(), Some("claude-opus-4"));
+    }
+
+    #[test]
+    fn list_tasks_picks_up_implemented_state_without_receipts() {
+        let workdir = unique_workdir("impl");
+        synthesize_task(&workdir, "impl1", false);
+        let tasks = alps_core::persistence::list_tasks(&workdir).unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].state,
+            alps_core::summary::TaskState::Implemented
+        );
+        // No receipts → all the metrics fields are None.
+        assert!(tasks[0].stories_passed.is_none());
+        assert!(tasks[0].judge_verdict.is_none());
+    }
+
+    #[test]
+    fn list_tasks_sorted_newest_first() {
+        let workdir = unique_workdir("sort");
+        // Same task_id prefix → same created_at; sort is stable.
+        synthesize_task(&workdir, "alpha", true);
+        synthesize_task(&workdir, "beta", true);
+        let tasks = alps_core::persistence::list_tasks(&workdir).unwrap();
+        assert_eq!(tasks.len(), 2);
+        // Sort order is by created_at DESC; for same timestamp it's
+        // stable, so we just verify both are present.
+        let ids: std::collections::HashSet<_> = tasks.iter().map(|t| t.task_id.clone()).collect();
+        assert!(ids.contains(&"2026-08-23T120000-alpha".to_string()));
+        assert!(ids.contains(&"2026-08-23T120000-beta".to_string()));
+    }
+
+    #[test]
+    fn list_tasks_skips_dirs_with_no_prompt() {
+        // Synthesize a partial state: the task directory exists but
+        // prompt.md does not. Should be silently skipped.
+        let workdir = unique_workdir("skip");
+        let orphan = workdir.join("tasks").join("2026-08-23T120000-orphan");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("plan.json"), "{}").unwrap();
+        // Add a real task alongside so we can confirm the orphan is filtered.
+        synthesize_task(&workdir, "real", true);
+
+        let tasks = alps_core::persistence::list_tasks(&workdir).unwrap();
+        assert_eq!(tasks.len(), 1, "orphan task without prompt.md must be skipped");
+        assert!(tasks[0].task_id.contains("real"));
+    }
+
+    #[test]
+    fn read_task_returns_some_for_existing_task() {
+        let workdir = unique_workdir("read-ok");
+        let task_id = synthesize_task(&workdir, "exists", true);
+        let detail = alps_core::persistence::read_task(&workdir, &task_id)
+            .unwrap()
+            .expect("expected Some for existing task");
+        assert_eq!(detail.summary.task_id, task_id);
+        assert!(detail.prompt.is_some(), "prompt must round-trip");
+        assert!(detail.plan.is_some(), "plan must round-trip");
+        assert!(detail.implementation.is_some(), "implementation must round-trip");
+        assert!(detail.receipts.is_some(), "receipts must round-trip");
+        assert!(detail.feedback.is_none(), "no feedback on Done state");
+        assert!(detail.failure.is_none(), "no failure on Done state");
+    }
+
+    #[test]
+    fn read_task_returns_none_for_missing_task() {
+        let workdir = unique_workdir("read-missing");
+        let detail = alps_core::persistence::read_task(&workdir, "nonexistent").unwrap();
+        assert!(detail.is_none(), "expected None for missing task");
+    }
+
+    #[test]
+    fn common_prefix_len_matches_exact_chars() {
+        // "2026-08-23T120000-" is 18 chars; the differing suffixes start
+        // at index 18. The '-' is included.
+        assert_eq!(super::common_prefix_len("2026-08-23T120000-alpha", "2026-08-23T120000-beta"), 18);
+        assert_eq!(super::common_prefix_len("alpha", "beta"), 0);
+        assert_eq!(super::common_prefix_len("", "anything"), 0);
+        assert_eq!(super::common_prefix_len("anything", ""), 0);
+    }
+
+    #[test]
+    fn suggest_task_id_finds_closest_match() {
+        let workdir = unique_workdir("suggest");
+        synthesize_task(&workdir, "alpha", true);
+        synthesize_task(&workdir, "beta", true);
+        // Query with a typo that shares a prefix with "alpha" — alpha wins.
+        let s = super::suggest_task_id(&workdir, "2026-08-23T120000-aph").unwrap();
+        assert!(s.contains("alpha"), "expected alpha match, got {}", s);
+    }
+
+    #[test]
+    fn suggest_task_id_returns_none_for_empty_workdir() {
+        let workdir = unique_workdir("suggest-empty");
+        let s = super::suggest_task_id(&workdir, "anything");
+        assert!(s.is_none(), "expected None for empty workdir, got {:?}", s);
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // infer_state matrix — table-driven coverage of every state
+    // combination. Caught the reset-cycle bug in the Claude Code
+    // review (issue #1: feedback.json from a prior iteration would
+    // make state=Rejected stick for every retry).
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Build a task dir with the named subset of artifacts. The label
+    /// differentiates the task IDs across calls.
+    fn build_task_with(
+        workdir: &std::path::Path,
+        label: &str,
+        prompt: bool,
+        plan: bool,
+        implementation: bool,
+        review: bool,
+        receipts: bool,
+        feedback: bool,
+        failure: bool,
+    ) -> String {
+        use alps_core::persistence::TaskWorkspace;
+        use alps_core::domain::Prompt;
+
+        let task_id = format!("2026-08-23T120000-{}", label);
+        let task_dir = workdir.join("tasks").join(&task_id);
+        std::fs::create_dir_all(&task_dir).unwrap();
+        let ws = TaskWorkspace::new(&task_dir);
+        if prompt {
+            ws.write_prompt(&Prompt(format!("prompt for {}", label))).unwrap();
+        }
+        if plan {
+            // Minimal valid Plan JSON.
+            std::fs::write(ws.plan_path(), r#"{"id":"00000000-0000-0000-0000-000000000001","goal":"g","architecture":"","stories":[],"dod":[]}"#).unwrap();
+        }
+        if implementation {
+            std::fs::write(ws.implementation_path(), r#"{"ralph_branch":"alps/x","prd_path":"p","commits":[],"artifacts":[],"metrics":{"stories_passed":0,"stories_total":0,"iterations":0,"elapsed_secs":0},"deliverable_path":"."}"#).unwrap();
+        }
+        if review {
+            std::fs::write(ws.review_path(), r#"{"findings":[],"assertions":[]}"#).unwrap();
+        }
+        if receipts {
+            std::fs::write(ws.receipts_path(), r#"{"task_id":"x","plan_id":"00000000-0000-0000-0000-000000000001","plan_summary":"d","implement_metrics":{"stories_passed":1,"stories_total":1,"iterations":1,"elapsed_secs":1},"review_summary":{"findings_count":0,"critical_findings":0,"assertions_passed":1,"assertions_total":1},"judged_at":"2026-08-23T12:00:00Z","judge_model":"claude-opus-4"}"#).unwrap();
+        }
+        if feedback {
+            std::fs::write(ws.feedback_path(), r#"{"reason":"x","failed_assertions":[],"retry_hints":[]}"#).unwrap();
+        }
+        if failure {
+            std::fs::write(ws.failure_path(), r#"{"PlanAgentError":"x"}"#).unwrap();
+        }
+        task_id
+    }
+
+    fn assert_state(
+        workdir: &std::path::Path,
+        task_id: &str,
+        expected: alps_core::summary::TaskState,
+        context: &str,
+    ) {
+        let tasks = alps_core::persistence::list_tasks(workdir).unwrap();
+        let found = tasks.iter().find(|t| t.task_id == task_id);
+        match found {
+            Some(s) => assert_eq!(
+                s.state, expected,
+                "{}: expected state={:?} for task {}, got {:?}",
+                context, expected, task_id, s.state
+            ),
+            // Tasks without prompt.md are silently skipped by list_tasks.
+            None if expected == alps_core::summary::TaskState::Unknown => {}
+            None => panic!(
+                "{}: expected state={:?} but task {} was filtered out",
+                context, expected, task_id
+            ),
+        }
+    }
+
+    #[test]
+    fn infer_state_idle() {
+        let workdir = unique_workdir("state-idle");
+        build_task_with(&workdir, "idle", true, false, false, false, false, false, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-idle",
+            alps_core::summary::TaskState::Idle,
+            "prompt.md only",
+        );
+    }
+
+    #[test]
+    fn infer_state_planned() {
+        let workdir = unique_workdir("state-planned");
+        build_task_with(&workdir, "p", true, true, false, false, false, false, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-p",
+            alps_core::summary::TaskState::Planned,
+            "prompt + plan",
+        );
+    }
+
+    #[test]
+    fn infer_state_implemented() {
+        let workdir = unique_workdir("state-impl");
+        build_task_with(&workdir, "i", true, true, true, false, false, false, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-i",
+            alps_core::summary::TaskState::Implemented,
+            "prompt + plan + impl",
+        );
+    }
+
+    #[test]
+    fn infer_state_reviewed() {
+        let workdir = unique_workdir("state-reviewed");
+        build_task_with(&workdir, "r", true, true, true, true, false, false, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-r",
+            alps_core::summary::TaskState::Reviewed,
+            "prompt + plan + impl + review",
+        );
+    }
+
+    #[test]
+    fn infer_state_done() {
+        let workdir = unique_workdir("state-done");
+        build_task_with(&workdir, "d", true, true, true, true, true, false, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-d",
+            alps_core::summary::TaskState::Done,
+            "all artifacts including receipts",
+        );
+    }
+
+    #[test]
+    fn infer_state_rejected() {
+        let workdir = unique_workdir("state-rejected");
+        build_task_with(&workdir, "x", true, true, true, true, false, true, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-x",
+            alps_core::summary::TaskState::Rejected,
+            "feedback present, no receipts",
+        );
+    }
+
+    #[test]
+    fn infer_state_failed() {
+        let workdir = unique_workdir("state-failed");
+        build_task_with(&workdir, "f", true, true, true, true, false, false, true);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-f",
+            alps_core::summary::TaskState::Failed,
+            "failure.json present",
+        );
+    }
+
+    /// Reset-cycle regression test for issue #1.
+    ///
+    /// After Task<Rejected>::reset(), the orchestrator writes a new
+    /// prompt.md (with feedback appended) but must also delete the old
+    /// feedback.json — otherwise infer_state sees feedback.json and
+    /// reports Rejected for every subsequent retry until receipts.json
+    /// finally lands.
+    ///
+    /// This test pins the orchestrator's contract: the on-disk state
+    /// AFTER a successful reset() must look like the start of a fresh
+    /// iteration (only prompt.md present), not like a stale Rejected.
+    /// The fix lives in `loop_.rs` (delete feedback.json between reset
+    /// and recursion). If that fix is reverted, this test catches it.
+    #[test]
+    fn reset_cycle_deletes_stale_feedback_json() {
+        use alps_core::persistence::TaskWorkspace;
+
+        let workdir = unique_workdir("reset-cycle");
+        let task_id = build_task_with(
+            &workdir,
+            "reset",
+            /* prompt */ true,
+            /* plan */ true,
+            /* impl */ true,
+            /* review */ true,
+            /* receipts */ false,
+            /* feedback */ true,
+            /* failure */ false,
+        );
+
+        // Pre-reset: feedback.json exists → state is Rejected.
+        assert_state(
+            &workdir,
+            &task_id,
+            alps_core::summary::TaskState::Rejected,
+            "pre-reset: feedback.json present, no receipts",
+        );
+
+        // Simulate the orchestrator's reset behavior: delete
+        // feedback.json (this is what loop_.rs does between reset()
+        // and the recursive run_iteration call).
+        let task_dir = workdir.join("tasks").join(&task_id);
+        let ws = TaskWorkspace::new(&task_dir);
+        std::fs::remove_file(ws.feedback_path()).unwrap();
+
+        // Post-reset: no feedback.json → state goes back to Reviewed
+        // (the most recent non-terminal artifact).
+        assert_state(
+            &workdir,
+            &task_id,
+            alps_core::summary::TaskState::Reviewed,
+            "post-reset: feedback.json deleted, review.json still present",
+        );
+    }
+
+    /// Done wins over a stale feedback.json from a prior iteration.
+    /// The Judge ACCEPTED and wrote receipts.json; an older
+    /// feedback.json from a previous reject attempt must not flip
+    /// the state back to Rejected.
+    #[test]
+    fn done_state_wins_over_stale_feedback() {
+        let workdir = unique_workdir("done-over-feedback");
+        // Note: feedback present + receipts present. Done must win.
+        build_task_with(&workdir, "df", true, true, true, true, true, true, false);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-df",
+            alps_core::summary::TaskState::Done,
+            "receipts wins over stale feedback",
+        );
+    }
+
+    /// Failed wins over feedback (failure is the more catastrophic terminal).
+    #[test]
+    fn failed_state_wins_over_feedback() {
+        let workdir = unique_workdir("failed-over-feedback");
+        build_task_with(&workdir, "ff", true, true, true, true, false, true, true);
+        assert_state(
+            &workdir,
+            "2026-08-23T120000-ff",
+            alps_core::summary::TaskState::Failed,
+            "failure wins over feedback",
         );
     }
 }

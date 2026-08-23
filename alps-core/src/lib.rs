@@ -50,6 +50,7 @@ pub mod judge;
 pub mod loop_;
 pub mod persistence;
 pub mod plan;
+pub mod summary;
 pub mod ralph;
 pub mod receipt;
 pub mod review;
@@ -69,6 +70,12 @@ pub use loop_::drive;
 pub use persistence::{TaskWorkspace, PersistenceError, Persistable, persist_task};
 pub use plan::{PlanAgent, PlanError};
 pub use receipt::{ImplementMetrics, Receipt, Receipts, ReviewSummary};
+/// Re-export of the `uuid` crate so downstream consumers (alps-cli,
+/// alps-gui) don't need to add their own direct dep just to mint a
+/// PlanId for test fixtures. The alps-gui dashboard never mints UUIDs
+/// itself, but alps-cli's unit tests do.
+pub use uuid;
+pub use summary::{TaskDetail, TaskList, TaskNotFound, TaskState, TaskSummary};
 pub use review::{ReviewAgent, ReviewConfig, ReviewContext, ReviewError};
 pub use task::{
     Attempt, Done, Failed, FailureReason, Idle, Implemented, Planned, Rejected, Reviewed, Task,

@@ -19,3 +19,6 @@ Cargo.lock.bak
 # Smoke archive (preserved receipts + deliverables from Tier-4 smokes).
 # Local-only — not part of the source repo. See smoke-archive/YYYY-MM-DD/<smoke>-preserved/.
 /smoke-archive/
+# Vite dev-server cache from prior smokes (Tier-3, 2026-08-08).
+# Local-only; not part of the source repo.
+/.vite/
