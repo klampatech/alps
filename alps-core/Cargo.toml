@@ -6,14 +6,26 @@ description = "ALPS — Agentic Loop Programming System (core library)"
 license = "MIT"
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "1"
-uuid = { version = "1", features = ["v4", "serde"] }
+uuid = { version = "1", features = ["v4", "serde", "js"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
+
+# Native-only deps. Tokio's process/IO modules don't compile to
+# wasm32-unknown-unknown (their underlying syscalls are unix-only).
+# The orchestrator's process-spawning logic (judge.rs, plan.rs,
+# ralph.rs, etc.) is server-only — clients of this crate that target
+# wasm (e.g. alps-ui's browser build) only need the serde-derived
+# type definitions, which compile cleanly without tokio.
+#
+# Each tokio-using module is gated behind
+# `#[cfg(not(target_arch = "wasm32"))]` so the wasm build of
+# alps-core is a pure types crate.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { version = "1", features = ["full"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -40,34 +40,52 @@
 // `[plan|implement|review|judge|done|rejected]` in the orchestrator's stderr
 // and find the exact death point.
 
+// Tokio-using modules are gated to native builds only. Tokio's
+// process/IO modules don't compile to `wasm32-unknown-unknown` (the
+// underlying syscalls are unix-only), so alps-core on wasm is a
+// pure types crate — clients like alps-ui's browser build deserialize
+// the serde-derived types without needing the orchestrator logic.
+// The `pub use` re-exports below for those modules are also gated.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod agent;
 pub mod agents_md;
 pub mod domain;
 pub mod error;
 pub mod git_ops;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod implement;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod judge;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod loop_;
 pub mod persistence;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod plan;
 pub mod summary;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod ralph;
 pub mod receipt;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod review;
 pub mod task;
 pub mod telemetry;
 pub mod workdir_guard;
 
+#[cfg(not(target_arch = "wasm32"))]
 pub use agent::{Agent, EmptyInput, sealed};
 pub use domain::*;
 pub use error::AlpsError;
+#[cfg(not(target_arch = "wasm32"))]
 pub use implement::{ImplementAgent, ImplementConfig, ImplementError};
+#[cfg(not(target_arch = "wasm32"))]
 pub use judge::{
     JudgeAgent, JudgeContext, JudgeError, LlmJudge, StructuredJudge,
     StructuredResult, AlwaysPassStructured, AlwaysPassLlm,
 };
+#[cfg(not(target_arch = "wasm32"))]
 pub use loop_::drive;
 pub use persistence::{TaskWorkspace, PersistenceError, Persistable, persist_task};
+#[cfg(not(target_arch = "wasm32"))]
 pub use plan::{PlanAgent, PlanError};
 pub use receipt::{ImplementMetrics, Receipt, Receipts, ReviewSummary};
 /// Re-export of the `uuid` crate so downstream consumers (alps-cli,
@@ -76,6 +94,7 @@ pub use receipt::{ImplementMetrics, Receipt, Receipts, ReviewSummary};
 /// itself, but alps-cli's unit tests do.
 pub use uuid;
 pub use summary::{TaskDetail, TaskList, TaskNotFound, TaskState, TaskSummary};
+#[cfg(not(target_arch = "wasm32"))]
 pub use review::{ReviewAgent, ReviewConfig, ReviewContext, ReviewError};
 pub use task::{
     Attempt, Done, Failed, FailureReason, Idle, Implemented, Planned, Rejected, Reviewed, Task,
