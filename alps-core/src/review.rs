@@ -71,7 +71,11 @@ impl Default for ReviewConfig {
     fn default() -> Self {
         ReviewConfig {
             claude_path: "claude".to_string(),
-            model: "claude-sonnet-4".to_string(),
+            // Claude Sonnet 4 was retired on 2026-06-15; the `claude` CLI now
+            // refuses the alias with exit-1 ("Sonnet 4 was retired..."). Default
+            // to the current Opus 4.5 alias, which matches the Judge default
+            // at `alps-core/src/judge.rs:186` (`claude-opus-4`).
+            model: "claude-opus-4-5".to_string(),
             max_file_bytes: 50_000,
             max_total_bytes: 500_000,
             max_retries: default_max_retries(),
