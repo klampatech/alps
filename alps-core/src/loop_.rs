@@ -167,6 +167,19 @@ fn run_iteration<'a>(
                 let reason = rejected.state.feedback.reason.clone();
                 elog!("[rejected] {} — restarting with feedback", reason);
                 let next = rejected.reset(vec![]);
+                // The new iteration starts in Task<Idle>, which has its
+                // own prompt.md that overwrites the old one (with
+                // feedback appended). The previous feedback.json is now
+                // stale — leaving it on disk would make `infer_state`
+                // misfire with state=Rejected for every retry. Delete
+                // it here so the next infer_state sees only prompt.md
+                // and reports Idle/Planned/.../Done honestly.
+                //
+                // Tracked 2026-08-23 by the alps-gui prereq review —
+                // see vault ~/Obsidian/projects/alps-ui-spec.md §11.5.
+                if workspace.feedback_path().exists() {
+                    let _ = std::fs::remove_file(workspace.feedback_path());
+                }
                 run_iteration(next, plan, implement, review, judge, workspace).await
             }
         }
